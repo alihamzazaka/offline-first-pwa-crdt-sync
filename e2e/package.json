@@ -1,0 +1,15 @@
+{
+  "name": "@offline-inventory/e2e",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Playwright multi-context correctness suite: the reproducible proof that concurrent offline edits converge with no lost writes and no duplicates.",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.1"
+  }
+}

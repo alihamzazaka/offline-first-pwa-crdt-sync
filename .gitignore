@@ -1,0 +1,47 @@
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+# --- ML artifacts (large; publish weights to Hugging Face Hub, not GitHub) ---
+models/
+outputs/
+wandb/
+*.safetensors
+*.onnx
+*.onnx.data
+*.gguf
+*.bin
+*.pt
+*.ckpt
+*.pth
+# --- Datasets & caches (regenerable via the pipeline / RUNBOOK) ---
+data/
+!data/.gitkeep
+.cache/
+hf_cache/
+*.db
+# --- Node / web ---
+node_modules/
+.next/
+.turbo/
+*.tsbuildinfo
+coverage/
+playwright-report/
+test-results/
+# --- runtime RUM / sync data ---
+**/vitals.ndjson
+**/vitals-report.*
+server/data/
+# --- OS / editor / logs ---
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.*

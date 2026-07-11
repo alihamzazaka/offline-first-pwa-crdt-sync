@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1e293b"/>
+      <stop offset="1" stop-color="#0f172a"/>
+    </linearGradient>
+  </defs>
+  <rect width="192" height="192" rx="36" fill="url(#bg)"/>
+  <!-- inventory crate -->
+  <g stroke="#38bdf8" stroke-width="8" stroke-linejoin="round" fill="none">
+    <path d="M96 40 L148 66 L148 118 L96 144 L44 118 L44 66 Z"/>
+    <path d="M44 66 L96 92 L148 66"/>
+    <path d="M96 92 L96 144"/>
+  </g>
+  <!-- sync arrows -->
+  <g stroke="#4ade80" stroke-width="7" stroke-linecap="round" fill="none">
+    <path d="M60 160 A44 44 0 0 1 132 160" transform="translate(0,-6)"/>
+  </g>
+  <g fill="#4ade80">
+    <path d="M132 142 l14 12 -18 6 z"/>
+  </g>
+</svg>

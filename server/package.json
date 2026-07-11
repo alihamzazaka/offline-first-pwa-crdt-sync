@@ -1,0 +1,22 @@
+{
+  "name": "@offline-inventory/server",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Hand-rolled y-websocket sync relay for the offline-first inventory PWA: CRDT convergence, debounced file-based Y.Doc snapshot persistence, /health, and a REST snapshot export. Pure JS, no native deps.",
+  "type": "module",
+  "main": "src/index.mjs",
+  "scripts": {
+    "dev": "node src/index.mjs",
+    "start": "node src/index.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "lib0": "^0.2.99",
+    "y-protocols": "^1.0.6",
+    "y-websocket": "^2.0.4",
+    "ws": "^8.18.0",
+    "yjs": "^13.6.20"
+  }
+}

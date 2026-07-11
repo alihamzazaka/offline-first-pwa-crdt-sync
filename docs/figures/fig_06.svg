@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1138 294" font-family="Segoe UI, Arial, sans-serif">
+<rect x="0" y="0" width="1138" height="294" fill="#FFFFFF"/>
+<text x="30" y="42" font-size="22" font-weight="700" fill="#2C2C2A">06 · Offline PWA + CRDT</text>
+<text x="30" y="66" font-size="14" fill="#5F5E5A">Yjs sync, Playwright suite</text>
+<rect x="30" y="92" width="244" height="168" rx="10" fill="#FCEBEB" stroke="#A32D2D" stroke-width="1.5"/>
+<text x="46" y="118" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="600" fill="#A32D2D" letter-spacing="0.5">PROBLEM</text>
+<text x="46" y="144" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" fill="#501313">Offline apps lose</text>
+<text x="46" y="164" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" fill="#501313">concurrent edits (last-</text>
+<text x="46" y="184" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" fill="#501313">write-wins); correctness</text>
+<text x="46" y="204" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" fill="#501313">never actually run</text>
+<path d="M 280 176.0 l 22 0 m -7 -6 l 7 6 l -7 6" fill="none" stroke="#5F5E5A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="308" y="92" width="244" height="168" rx="10" fill="#FAEEDA" stroke="#854F0B" stroke-width="1.5"/>
+<text x="324" y="118" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="600" fill="#854F0B" letter-spacing="0.5">DIAGNOSIS</text>
+<text x="324" y="144" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" fill="#412402">Naive sync overwrites;</text>
+<text x="324" y="164" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" fill="#412402">need a CRDT with a</text>
+<text x="324" y="184" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" fill="#412402">mergeable quantity</text>
+<text x="324" y="204" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" fill="#412402">delta-counter</text>
+<path d="M 558 176.0 l 22 0 m -7 -6 l 7 6 l -7 6" fill="none" stroke="#5F5E5A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="586" y="92" width="244" height="168" rx="10" fill="#E6F1FB" stroke="#185FA5" stroke-width="1.5"/>
+<text x="602" y="118" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="600" fill="#185FA5" letter-spacing="0.5">SOLUTION</text>
+<text x="602" y="144" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" fill="#042C53">Yjs CRDT + qty delta-</text>
+<text x="602" y="164" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" fill="#042C53">counter + y-websocket;</text>
+<text x="602" y="184" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" fill="#042C53">first real execution</text>
+<text x="602" y="204" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" fill="#042C53">on the GPU box</text>
+<path d="M 836 176.0 l 22 0 m -7 -6 l 7 6 l -7 6" fill="none" stroke="#5F5E5A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="864" y="92" width="244" height="168" rx="10" fill="#EAF3DE" stroke="#3B6D11" stroke-width="1.5"/>
+<text x="880" y="118" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="600" fill="#3B6D11" letter-spacing="0.5">RESULT</text>
+<text x="880" y="144" font-family="Segoe UI, Arial, sans-serif" font-size="21" font-weight="700" fill="#173404">16/16 green</text>
+<text x="880" y="170" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" fill="#173404">delta +5 &amp; +3 -&gt; +8</text>
+<text x="880" y="190" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" fill="#173404">three-way, cross-tab,</text>
+<text x="880" y="210" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" fill="#173404">tombstone all pass</text>
+</svg>

@@ -1,0 +1,21 @@
+{
+  "name": "offline-first-pwa-sync-conflict",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Offline-first inventory / stock-count PWA with Yjs CRDT sync and a reproducible Playwright concurrent-edit correctness suite.",
+  "workspaces": [
+    "app",
+    "server",
+    "e2e"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,app -c blue,green \"npm:dev:server\" \"npm:dev:app\"",
+    "dev:server": "npm run dev --workspace=server",
+    "dev:app": "npm run dev --workspace=app",
+    "build": "npm run build --workspace=app",
+    "test:e2e": "npm run test --workspace=e2e"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
