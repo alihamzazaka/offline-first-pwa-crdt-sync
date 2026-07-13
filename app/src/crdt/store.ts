@@ -225,6 +225,18 @@ export function getItems(): ItemSnapshot[] {
   return itemsCache
 }
 
+/**
+ * The compaction epoch this doc currently carries (0 until the server first
+ * seals one — see server/src/compaction.mjs and crdt/rebase.ts). Exposed so the
+ * UI/tests can observe when an epoch advances; the reconnect path compares it
+ * against the server's to decide whether a rebase is required.
+ */
+export function getEpoch(): number {
+  const meta = doc.getMap('meta') as Y.Map<unknown>
+  const e = meta.get('epoch')
+  return typeof e === 'number' ? e : 0
+}
+
 export function subscribeItems(cb: () => void): () => void {
   itemsListeners.add(cb)
   return () => itemsListeners.delete(cb)
@@ -352,6 +364,7 @@ declare global {
       getConflicts: () => ConflictEntry[]
       getStatus: () => SyncStatus
       getPending: () => Promise<number>
+      getEpoch: () => number
       setOffline: (off: boolean) => void
       /** Idempotent journal replay (S3 proof). Dynamic import avoids a static store↔ops cycle. */
       replay: () => Promise<{ applied: number; skipped: number }>
@@ -365,6 +378,7 @@ window.__inv = {
   getConflicts,
   getStatus,
   getPending: pendingCount,
+  getEpoch,
   setOffline,
   replay: async () => (await import('./ops')).replayJournal()
 }

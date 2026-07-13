@@ -43,12 +43,16 @@
  * items on every replica (deterministic outcome), while B's edit remains in
  * state — auditable, and recoverable by an explicit "restore" (set
  * `deleted:false`) if the product ever wants un-delete.
- * GC policy: tombstones are retained for the life of the room in this build
- * (rooms are per-count sessions, so growth is bounded). A production
- * compaction would run server-side: once every known replica has synced past
- * a checkpoint, rebuild the room doc without tombstoned items older than N
- * days and start a new epoch. Never GC on a timer alone — a long-offline
- * client past the horizon must be forced to rebase, not allowed to resurrect.
+ * GC policy: v1.0 retained tombstones for the life of the room. Phase 2 (v2.0)
+ * adds server-side EPOCH COMPACTION (server/src/compaction.mjs): at a safe
+ * checkpoint — an idle room, where every known replica has synced — the server
+ * rebuilds the room into a new epoch, collapsing each qty array to a single
+ * base delta and dropping tombstones older than the horizon. A long-offline
+ * client past the horizon is forced to REBASE, not allowed to resurrect: it
+ * adopts the epoch base and replays only its pending journal ops, dropping any
+ * that target a collected item (crdt/rebase.ts). The `deletedAt` stamp below is
+ * what lets compaction age a tombstone. Proven over thousands of histories in
+ * fuzz/epoch-compaction.fuzz.mjs.
  */
 
 import * as Y from 'yjs'
@@ -161,12 +165,19 @@ export function adjustQty(id: string, delta: number): void {
   journal('adjustQty', opId, { id, delta })
 }
 
-/** Tombstone delete — policy documented in the module header. */
+/**
+ * Tombstone delete — policy documented in the module header. Stamps `deletedAt`
+ * (wall-clock ms) so server-side epoch compaction can age a tombstone past a
+ * horizon before garbage-collecting it (see server/src/compaction.mjs). Like
+ * every other timestamp here it is audit/GC metadata only — never used for
+ * merge ordering.
+ */
 export function deleteItem(id: string): void {
   const m = requireItem(id)
   const opId = ulid()
   doc.transact(() => {
     m.set('deleted', true)
+    m.set('deletedAt', Date.now())
   }, LOCAL_ORIGIN)
   journal('deleteItem', opId, { id })
 }
@@ -177,6 +188,7 @@ export function restoreItem(id: string): void {
   const opId = ulid()
   doc.transact(() => {
     m.set('deleted', false)
+    m.set('deletedAt', null) // a restored item is no longer an aging tombstone
   }, LOCAL_ORIGIN)
   journal('updateField', opId, { id, field: 'deleted', value: false })
 }
@@ -272,6 +284,7 @@ function reapplyJournalOp(op: JournalEntry): boolean {
       if (!m) return false
       if (m.get('deleted') === true) return false
       m.set('deleted', true)
+      if (typeof m.get('deletedAt') !== 'number') m.set('deletedAt', op.ts)
       return true
     }
     case 'adjustQty': {

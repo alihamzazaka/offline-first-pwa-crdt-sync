@@ -44,6 +44,7 @@ import * as syncProtocol from 'y-protocols/sync'
 import * as awarenessProtocol from 'y-protocols/awareness'
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
+import { sealEpoch, compactionPressure } from './compaction.mjs'
 
 // ---------------------------------------------------------------------------
 // Config
@@ -59,6 +60,21 @@ const PERSIST_DEBOUNCE_MS = Number.parseInt(process.env.SYNC_PERSIST_MS ?? '750'
 const PING_TIMEOUT_MS = 30_000
 /** Snapshots untouched for longer than this are pruned on boot. */
 const SNAPSHOT_MAX_AGE_DAYS = Number.parseInt(process.env.SNAPSHOT_MAX_AGE_DAYS ?? '30', 10)
+
+// --- Epoch compaction (Phase 2 · v2.0) -------------------------------------
+// Compaction bounds the qty-delta arrays and the tombstone set (see
+// server/src/compaction.mjs). It is safe only at a checkpoint where every
+// connected replica has synced — which, in this relay, is when a room has NO
+// connected peers. So we compact idle rooms only. AUTO-compaction is opt-in
+// (SYNC_AUTO_COMPACT=1) to keep default behaviour — and the green Playwright
+// suite — untouched; the admin endpoint POST /rooms/:room/compact is always
+// available for an on-demand seal.
+const AUTO_COMPACT = process.env.SYNC_AUTO_COMPACT === '1'
+/** Tombstones older than this are GC'd on seal (default 7 days). */
+const COMPACT_TOMBSTONE_MAX_AGE_MS = Number.parseInt(
+  process.env.SYNC_COMPACT_TOMBSTONE_MS ?? String(7 * 86_400_000), 10)
+/** Auto-compaction only fires when an idle room has at least this much to shed. */
+const COMPACT_MIN_PRESSURE = Number.parseInt(process.env.SYNC_COMPACT_MIN_PRESSURE ?? '64', 10)
 
 // y-websocket message types (wire-compatible with the client provider).
 const MESSAGE_SYNC = 0
@@ -224,6 +240,77 @@ function flushAllSnapshots() {
   }
 }
 
+/**
+ * Seal a new compaction epoch for a room (Phase 2 · v2.0).
+ *
+ * Refuses to compact a room with connected peers unless `force` — those peers
+ * are at the current epoch and a seal would strand them mid-session; the safe
+ * checkpoint is an idle room (everyone has synced). On success it swaps the
+ * in-memory doc for the sealed one, persists the new snapshot, and returns the
+ * seal stats. A client that reconnects afterwards discovers the higher
+ * meta.epoch and rebases its pending ops (app/src/crdt/rebase.ts) instead of
+ * resurrecting the collected state.
+ *
+ * @returns {{ ok: boolean, reason?: string, room: string, epoch?: number, stats?: object }}
+ */
+function compactRoomDoc(room, { force = false } = {}) {
+  const name = safeRoomName(room)
+  const doc = docs.get(name)
+  if (!doc) return { ok: false, reason: 'no_such_room', room: name }
+  if (doc.conns.size > 0 && !force) {
+    return { ok: false, reason: 'peers_connected', room: name, peers: doc.conns.size }
+  }
+
+  const { doc: sealed, epoch, stats } = sealEpoch(doc, {
+    now: Date.now(),
+    tombstoneMaxAgeMs: COMPACT_TOMBSTONE_MAX_AGE_MS
+  })
+
+  // Adopt the sealed epoch as the room's authoritative doc. Seed a fresh
+  // WSSharedDoc from the sealed state so its update/awareness wiring is intact,
+  // then hand any (forced) live peers the new base via the normal broadcast.
+  const fresh = new WSSharedDoc(name)
+  Y.applyUpdate(fresh, Y.encodeStateAsUpdate(sealed), 'compaction')
+  const oldConns = doc.conns
+  docs.set(name, fresh)
+  if (doc._persistTimer) {
+    clearTimeout(doc._persistTimer)
+    doc._persistTimer = null
+  }
+  doc.destroy()
+  sealed.destroy()
+
+  if (force && oldConns.size > 0) {
+    // Move any still-connected sockets onto the new doc and push a full sync.
+    oldConns.forEach((_ids, conn) => {
+      fresh.conns.set(conn, new Set())
+      const encoder = encoding.createEncoder()
+      encoding.writeVarUint(encoder, MESSAGE_SYNC)
+      syncProtocol.writeSyncStep1(encoder, fresh)
+      send(fresh, conn, encoding.toUint8Array(encoder))
+    })
+  }
+
+  writeSnapshot(name, fresh)
+  console.log(
+    `[compact] ${name} → epoch ${epoch}: kept ${stats.itemsKept} item(s), ` +
+    `dropped ${stats.tombstonesDropped} tombstone(s), deltas ${stats.deltasBefore}→${stats.deltasAfter}`
+  )
+  return { ok: true, room: name, epoch, stats }
+}
+
+/**
+ * On the transition to an idle room (last peer gone), optionally auto-seal if
+ * there is enough to shed. Opt-in via SYNC_AUTO_COMPACT so default/test runs
+ * are unaffected.
+ */
+function maybeAutoCompact(doc) {
+  if (!AUTO_COMPACT) return
+  if (doc.conns.size > 0) return
+  const pressure = compactionPressure(doc, Date.now(), COMPACT_TOMBSTONE_MAX_AGE_MS)
+  if (pressure >= COMPACT_MIN_PRESSURE) compactRoomDoc(doc.name)
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket protocol (hand-rolled setupWSConnection)
 // ---------------------------------------------------------------------------
@@ -249,6 +336,8 @@ function closeConn(doc, conn) {
     awarenessProtocol.removeAwarenessStates(doc.awareness, Array.from(controlledIds), null)
     // A room with no live peers keeps its doc in memory for fast reconnect;
     // its state is already durable on disk. (Bounded by rooms-per-session.)
+    // Idle is also the safe checkpoint for epoch compaction (opt-in).
+    if (doc.conns.size === 0) maybeAutoCompact(doc)
   }
   try {
     conn.close()
@@ -406,6 +495,7 @@ function sendJson(res, status, body) {
 }
 
 const SNAPSHOT_RE = /^\/rooms\/([^/]+)\/snapshot\/?$/
+const COMPACT_RE = /^\/rooms\/([^/]+)\/compact\/?$/
 
 function handleRequest(req, res) {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
@@ -413,10 +503,24 @@ function handleRequest(req, res) {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET,OPTIONS',
+      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
       'Access-Control-Allow-Headers': '*'
     })
     res.end()
+    return
+  }
+
+  // Admin: on-demand epoch seal (Phase 2 · v2.0). POST /rooms/:room/compact
+  // [?force=1]. Refuses a room with connected peers unless force=1.
+  if (req.method === 'POST') {
+    const cm = COMPACT_RE.exec(url.pathname)
+    if (cm) {
+      const room = decodeURIComponent(cm[1])
+      const result = compactRoomDoc(room, { force: url.searchParams.get('force') === '1' })
+      sendJson(res, result.ok ? 200 : 409, result)
+      return
+    }
+    sendJson(res, 405, { error: 'method_not_allowed' })
     return
   }
 
@@ -513,4 +617,4 @@ process.on('SIGTERM', () => shutdown('SIGTERM'))
 
 boot()
 
-export { exportItems, safeRoomName, WSSharedDoc, getRoomDoc }
+export { exportItems, safeRoomName, WSSharedDoc, getRoomDoc, compactRoomDoc }

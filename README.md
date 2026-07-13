@@ -64,6 +64,28 @@ Per the SPEC, the conflict model is a deliberate, documented choice:
 
 ---
 
+## Phase 2 / v2.0 (planned)
+
+The next-phase suite targets the four most senior distributed-systems
+capabilities left in the repo. **(1) Server-side epoch compaction / GC is now
+built** ✅ — `server/src/compaction.mjs` seals a new epoch at a safe checkpoint
+(an idle room), collapsing every ever-growing qty-delta array to a single base
+delta and garbage-collecting tombstones past a horizon, while a pre-horizon
+client is forced to **rebase, not resurrect** (`app/src/crdt/rebase.ts`: adopt
+the epoch base, replay only pending journal ops, drop any that target a collected
+item). It is proven over **800 random seal/rebase histories + deterministic
+cases** in [`fuzz/epoch-compaction.fuzz.mjs`](fuzz/epoch-compaction.fuzz.mjs)
+(bounded-growth · value-preserving · no-resurrect · no-double-count ·
+convergence), and exposed as an admin `POST /rooms/:room/compact` plus opt-in
+idle auto-compaction (`SYNC_AUTO_COMPACT=1`). Still **planned**: (2) **adversarial
+lossy-network testing** (real offline, CDP throttling, socket-kill
+mid-`SyncStep2`), (3) a **pluggable Postgres/MySQL persistence adapter** past the
+single-process file snapshot, and (4) **real Background Sync** (Workbox) + a
+GitHub Actions **CI**. Baseline: 16/16 Playwright + (now) **4/4 fuzz suites**
+green. See [docs/phase-2/README.md](docs/phase-2/README.md).
+
+---
+
 ## Tech stack (compact)
 
 **Next.js / React (PWA)** · **IndexedDB via Dexie.js** · **Yjs / Automerge (CRDT)** ·

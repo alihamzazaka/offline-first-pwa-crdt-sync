@@ -14,7 +14,8 @@
     "dev:app": "npm run dev --workspace=app",
     "build": "npm run build --workspace=app",
     "test:e2e": "npm run test --workspace=e2e",
-    "test:fuzz": "node --test fuzz/crdt-convergence.fuzz.mjs",
+    "test:fuzz": "node --test fuzz/crdt-convergence.fuzz.mjs fuzz/epoch-compaction.fuzz.mjs",
+    "test:fuzz:epoch": "node --test fuzz/epoch-compaction.fuzz.mjs",
     "test": "npm run test:fuzz && npm run test:e2e"
   },
   "devDependencies": {
