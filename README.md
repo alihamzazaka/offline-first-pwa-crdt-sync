@@ -115,15 +115,25 @@ duplicates / tombstone / ordered replay / cross-tab).
 
 - **Run it:** see [RUNBOOK.md](RUNBOOK.md) — `npm install`,
   `npx playwright install chromium`, `npm run dev`, `npm run test:e2e`.
-- **The proof:** `e2e/specs/` (8 specs → the 7 scenarios S1–S7 plus the
+- **The proof (examples):** `e2e/specs/` (8 specs → the 7 scenarios S1–S7 plus the
   delta-counter money shot), run under two chromium projects.
+- **The proof (property-based):** `fuzz/crdt-convergence.fuzz.mjs` — a
+  Jepsen-style fuzzer that generates **1500 random operation histories** (random
+  adjust/update/delete interleaved with random partition/heal points across 3
+  replicas) and asserts the three invariants on every one: **convergence**,
+  **qty = sum of applied deltas** (anti-LWW), and **tombstone**. The e2e suite
+  proves ~16 hand-picked scenarios; the fuzzer proves the same guarantees over
+  thousands of histories a human would never hand-write. Run `npm run test:fuzz`.
+  It also surfaced a genuine model property (documented in the file header):
+  *concurrent creates of the **same** id would discard one container's deltas —
+  the app avoids this by minting a fresh ULID per create, so ids never collide.*
 - **Demo:** [demo/script.md](demo/script.md) — the 60-second concurrent-merge clip.
 
 ## Repository layout
 
 ```
 06-offline-first-pwa-sync-conflict/
-├── package.json              # npm workspace root (app · server · e2e); dev + test:e2e scripts
+├── package.json              # npm workspace root (app · server · e2e); dev + test:e2e + test:fuzz scripts
 ├── README.md                 # this file
 ├── RUNBOOK.md                # run/demo/test/troubleshoot on another machine
 ├── SPEC.md                   # authoritative build spec
@@ -146,9 +156,11 @@ duplicates / tombstone / ordered replay / cross-tab).
 ├── server/                   # the sync backend
 │   ├── package.json          # yjs · y-websocket · ws · y-protocols · lib0 (pure JS, no native deps)
 │   └── src/index.mjs         # hand-rolled setupWSConnection · data/<room>.yss snapshots · /health · REST
-└── e2e/                      # the reproducible proof
-    ├── package.json          # @playwright/test
-    ├── playwright.config.ts  # webServer array (sync server + vite) · two chromium projects
-    ├── helpers/clients.ts    # isolated A/B contexts, offline toggle, CRUD, convergence assertions
-    └── specs/                # one spec per scenario (S1–S7 + qty delta-counter)
+├── e2e/                      # the reproducible proof (example-based)
+│   ├── package.json          # @playwright/test
+│   ├── playwright.config.ts  # webServer array (sync server + vite) · two chromium projects
+│   ├── helpers/clients.ts    # isolated A/B contexts, offline toggle, CRUD, convergence assertions
+│   └── specs/                # one spec per scenario (S1–S7 + qty delta-counter)
+└── fuzz/                     # the reproducible proof (property-based)
+    └── crdt-convergence.fuzz.mjs  # 1500 random histories · convergence + qty-sum + tombstone
 ```

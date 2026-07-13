@@ -13,9 +13,12 @@
     "dev:server": "npm run dev --workspace=server",
     "dev:app": "npm run dev --workspace=app",
     "build": "npm run build --workspace=app",
-    "test:e2e": "npm run test --workspace=e2e"
+    "test:e2e": "npm run test --workspace=e2e",
+    "test:fuzz": "node --test fuzz/crdt-convergence.fuzz.mjs",
+    "test": "npm run test:fuzz && npm run test:e2e"
   },
   "devDependencies": {
-    "concurrently": "^9.1.0"
+    "concurrently": "^9.1.0",
+    "fast-check": "^4.9.0"
   }
 }
