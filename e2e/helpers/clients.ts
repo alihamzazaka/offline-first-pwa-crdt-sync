@@ -230,6 +230,20 @@ export async function serverItems(page: Page, room: string): Promise<ItemSnapsho
   return body.items
 }
 
+/**
+ * Force-terminate every ws connection of a room server-side (test-only
+ * endpoint, guarded by SYNC_TEST_ENDPOINTS=1 in playwright.config.ts). Goes
+ * through `page.request` — Playwright's Node-side API context — so it works
+ * even while the page itself is under `context.setOffline` emulation.
+ * Returns how many sockets were killed.
+ */
+export async function killRoomConns(page: Page, room: string): Promise<number> {
+  const res = await page.request.post(`${SERVER_HTTP}/rooms/${encodeURIComponent(room)}/kill-conns`)
+  expect(res.ok(), 'kill-conns endpoint should exist (SYNC_TEST_ENDPOINTS=1)').toBeTruthy()
+  const body = (await res.json()) as { killed: number }
+  return body.killed
+}
+
 /** Return one item by id (or undefined) from a page's state. */
 export async function getItem(page: Page, id: string): Promise<ItemSnapshot | undefined> {
   const st = await getState(page)

@@ -88,10 +88,44 @@ convergence), the **real shipped modules** executed in
 (clear + reload + pending replay), and convergence with the collected item gone
 and the pending edit preserved. Idle auto-compaction is opt-in
 (`SYNC_AUTO_COMPACT=1`). Known scoped limitation: simultaneous multi-tab rebase
-has a narrow re-persistence window (documented in `store.ts`). Still
-**planned**: (2) **adversarial lossy-network testing** (CDP throttling,
-socket-kill mid-`SyncStep2`), (3) a **pluggable Postgres/MySQL persistence
-adapter**, and (4) **real Background Sync** (Workbox) + GitHub Actions **CI**.
+has a narrow re-persistence window (documented in `store.ts`). A GitHub Actions
+**CI workflow** ([.github/workflows/ci.yml](.github/workflows/ci.yml)) is now
+written — `npm ci` → Playwright chromium → `test:fuzz` → `test:e2e`, report
+uploaded on failure — but has **not yet run remotely** (pending first push).
+**(3) Pluggable snapshot persistence is now built** ✅ — the relay's debounced
+snapshot writes go through a **`StorageAdapter`**
+([`server/src/storage.mjs`](server/src/storage.mjs)): `SYNC_STORAGE=file`
+(default — the exact v1.0 `data/<room>.yss` atomic temp+rename behaviour,
+extracted verbatim) or `SYNC_STORAGE=postgres` (`yss_snapshots` upsert table
+via `SYNC_PG_URL`, `pg` driver with an injectable query client). Same
+`encodeStateAsUpdate` blob either way; debounce, flush-on-shutdown,
+prune-on-boot, and load-on-boot are preserved, and the full e2e suite boots the
+server through the adapter path. Honest caveat: the Postgres adapter is proven
+by unit tests against a fake query client
+([`server/test/storage.test.mjs`](server/test/storage.test.mjs), 19 passing —
+SQL/param/upsert contract) — it has **not** been run against a live Postgres
+here (no reachable DB on the build machine; a skipped integration test enables
+with `SYNC_PG_TEST_URL`).
+**(2) Adversarial lossy-network testing is now built** ✅ —
+[`e2e/specs/lossy-network.spec.ts`](e2e/specs/lossy-network.spec.ts) (NET1–NET3)
+re-proves the same all-replica convergence guarantee while the network itself
+misbehaves, instead of the clean `provider.disconnect()` toggle the rest of the
+suite uses: **NET1** real browser-level offline (`context.setOffline`) across
+concurrent edits on both clients — with a server-side assertion that **no write
+leaked through the partition** — then heal, converge, zero lost writes; **NET2**
+repeated **abortive socket kills mid-sync** — a test-only
+`POST /rooms/:room/kill-conns` endpoint (guarded behind `SYNC_TEST_ENDPOINTS=1`,
+`server/src/index.mjs`) `terminate()`s every ws connection of the room six times
+during 24 rapid concurrent edits per client, and the y-websocket reconnect +
+Yjs state-vector handshake must recover exactly the missing updates; **NET3**
+CDP-emulated 500 ms-latency network conditions with a mid-burst kill.
+**6/6 green, 0 flakes across `--repeat-each=5` (30/30)**. Honest scoping:
+Chromium's network emulation does not reliably sever or throttle an
+already-open WebSocket, so NET1 pairs `setOffline` with the socket kill (the
+emulation then blocks every reconnect until heal) and NET3 kills mid-burst so
+the reconnect handshake actually runs under the emulated latency; the socket
+kill is a server-side abortive TCP drop, not Playwright `routeWebSocket`.
+Still **planned**: (4) **real Background Sync** (Workbox).
 See [docs/phase-2/README.md](docs/phase-2/README.md).
 
 ---
@@ -147,9 +181,11 @@ duplicates / tombstone / ordered replay / cross-tab).
 
 - **Run it:** see [RUNBOOK.md](RUNBOOK.md) — `npm install`,
   `npx playwright install chromium`, `npm run dev`, `npm run test:e2e`.
-- **The proof (examples):** `e2e/specs/` (10 specs → scenarios S1–S8 including
-  the delta-counter money shot and the epoch-rebase full-stack scenario), run
-  under two chromium projects — **20/20 green**.
+- **The proof (examples):** `e2e/specs/` (11 specs → scenarios S1–S8 including
+  the delta-counter money shot and the epoch-rebase full-stack scenario, plus
+  the NET1–NET3 adversarial lossy-network scenarios — real offline, abortive
+  socket kills mid-sync, CDP latency), run under two chromium projects —
+  **26/26 green**.
 - **The proof (property-based):** `fuzz/crdt-convergence.fuzz.mjs` — a
   Jepsen-style fuzzer that generates **1500 random operation histories** (random
   adjust/update/delete interleaved with random partition/heal points across 3
@@ -192,13 +228,13 @@ duplicates / tombstone / ordered replay / cross-tab).
 ├── server/                   # the sync backend
 │   ├── package.json          # yjs · y-websocket · ws · y-protocols · lib0 (pure JS, no native deps)
 │   └── src/
-│       ├── index.mjs         # hand-rolled setupWSConnection · stale-writer guard · snapshots · /health · REST · /compact
+│       ├── index.mjs         # hand-rolled setupWSConnection · stale-writer guard · snapshots · /health · REST · /compact · test-only /kill-conns
 │       └── compaction.mjs    # epoch seal: collapse qty deltas + GC aged tombstones (v2.0)
 ├── e2e/                      # the reproducible proof (example-based)
 │   ├── package.json          # @playwright/test
 │   ├── playwright.config.ts  # webServer array (sync server + vite) · two chromium projects
 │   ├── helpers/clients.ts    # isolated A/B contexts, offline toggle, CRUD, convergence assertions
-│   └── specs/                # one spec per scenario (S1–S8 + qty delta-counter + epoch-rebase)
+│   └── specs/                # one spec per scenario (S1–S8 + qty delta-counter + epoch-rebase + NET1–NET3 lossy-network)
 └── fuzz/                     # the reproducible proof (property-based)
     ├── crdt-convergence.fuzz.mjs  # 1500 random histories · convergence + qty-sum + tombstone
     └── epoch-compaction.fuzz.mjs  # 800 random seal/rebase histories · bounded + no-resurrect (v2.0)

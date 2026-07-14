@@ -61,7 +61,10 @@ export default defineConfig({
         // explicit POST /rooms/:room/compact GCs them without waiting out the
         // 7-day production horizon. Auto-compaction stays OFF, so every other
         // spec sees an epoch-0 room and is unaffected.
-        SYNC_COMPACT_TOMBSTONE_MS: '0'
+        SYNC_COMPACT_TOMBSTONE_MS: '0',
+        // Lossy-network spec (F2): expose the test-only socket-kill endpoint
+        // POST /rooms/:room/kill-conns. Off by default outside this suite.
+        SYNC_TEST_ENDPOINTS: '1'
       }
     },
     {

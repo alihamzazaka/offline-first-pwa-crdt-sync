@@ -17,11 +17,15 @@
  *     CRDT updates are applied to the room doc and broadcast to the other
  *     clients — Yjs guarantees all replicas converge. This is the server-side
  *     half of the "both concurrent edits survive" story.
- *  2. **Durable snapshot persistence.** Each room's converged state is written
- *     to `data/<room>.yss` (Yjs State Snapshot = `Y.encodeStateAsUpdate`),
- *     debounced so a burst of edits costs one write. Snapshots are loaded on
- *     boot, so a server restart does not lose committed inventory — a fresh
- *     client that connects after a restart still hydrates the full history.
+ *  2. **Durable snapshot persistence.** Each room's converged state
+ *     (`Y.encodeStateAsUpdate`) is written through a pluggable StorageAdapter
+ *     (`server/src/storage.mjs`, Phase 2 · F3): `SYNC_STORAGE=file` (default —
+ *     `data/<room>.yss`, atomic temp+rename, exactly the v1.0 behaviour) or
+ *     `SYNC_STORAGE=postgres` (`yss_snapshots` table via `SYNC_PG_URL`).
+ *     Writes are debounced so a burst of edits costs one write; snapshots are
+ *     loaded on boot, so a server restart does not lose committed inventory —
+ *     a fresh client that connects after a restart still hydrates the full
+ *     history.
  *  3. `/health` — liveness + room census, for the Playwright `webServer`
  *     readiness probe and ops monitoring.
  *  4. `GET /rooms/:room/snapshot` — a plain-JSON export of a room's items
@@ -35,7 +39,6 @@
  */
 
 import http from 'node:http'
-import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
@@ -45,6 +48,7 @@ import * as awarenessProtocol from 'y-protocols/awareness'
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
 import { sealEpoch, compactionPressure, readEpoch } from './compaction.mjs'
+import { createStorageAdapter, safeRoomName } from './storage.mjs'
 
 // ---------------------------------------------------------------------------
 // Config
@@ -61,6 +65,14 @@ const PING_TIMEOUT_MS = 30_000
 /** Snapshots untouched for longer than this are pruned on boot. */
 const SNAPSHOT_MAX_AGE_DAYS = Number.parseInt(process.env.SNAPSHOT_MAX_AGE_DAYS ?? '30', 10)
 
+// --- Pluggable persistence (Phase 2 · F3) -----------------------------------
+// SYNC_STORAGE selects the snapshot backend. 'file' (default) is the exact
+// v1.0 behaviour: data/<room>.yss, atomic temp+rename, mtime prune. 'postgres'
+// upserts the SAME encodeStateAsUpdate blob into yss_snapshots via SYNC_PG_URL.
+// See server/src/storage.mjs for the StorageAdapter interface.
+const STORAGE_KIND = process.env.SYNC_STORAGE ?? 'file'
+const PG_URL = process.env.SYNC_PG_URL
+
 // --- Epoch compaction (Phase 2 · v2.0) -------------------------------------
 // Compaction bounds the qty-delta arrays and the tombstone set (see
 // server/src/compaction.mjs). It is safe only at a checkpoint where every
@@ -76,6 +88,14 @@ const COMPACT_TOMBSTONE_MAX_AGE_MS = Number.parseInt(
 /** Auto-compaction only fires when an idle room has at least this much to shed. */
 const COMPACT_MIN_PRESSURE = Number.parseInt(process.env.SYNC_COMPACT_MIN_PRESSURE ?? '64', 10)
 
+// --- Test-only endpoints (Phase 2 · F2) -------------------------------------
+// SYNC_TEST_ENDPOINTS=1 (set by the Playwright webServer env) exposes
+// POST /rooms/:room/kill-conns, which force-terminates every ws connection of a
+// room — the adversarial lossy-network spec uses it to sever live sockets
+// mid-sync and prove the Yjs handshake recovers exactly the missing updates.
+// OFF by default so a production deploy never ships a remote kill switch.
+const TEST_ENDPOINTS = process.env.SYNC_TEST_ENDPOINTS === '1'
+
 // y-websocket message types (wire-compatible with the client provider).
 const MESSAGE_SYNC = 0
 const MESSAGE_AWARENESS = 1
@@ -86,80 +106,43 @@ const WS_OPEN = 1
 const START_TIME = Date.now()
 
 // ---------------------------------------------------------------------------
-// Persistence (debounced file-based Y.Doc snapshots — data/<room>.yss)
+// Persistence (debounced Y.Doc snapshots through the StorageAdapter)
 // ---------------------------------------------------------------------------
 
-/** Room names arrive from an untrusted URL path; keep them to a safe filename. */
-function safeRoomName(room) {
-  return room.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 128) || 'default'
-}
+const storage = createStorageAdapter({
+  kind: STORAGE_KIND,
+  dataDir: DATA_DIR,
+  pgUrl: PG_URL
+})
 
-function snapshotPath(room) {
-  return path.join(DATA_DIR, `${safeRoomName(room)}.yss`)
-}
-
-function ensureDataDir() {
-  fs.mkdirSync(DATA_DIR, { recursive: true })
-}
-
-/** Synchronously load a room's snapshot into `doc` (called once, at doc creation). */
-function loadSnapshot(room, doc) {
-  const file = snapshotPath(room)
+/**
+ * Encode `doc` and hand the blob to the adapter. Fire-and-forget safe: adapter
+ * failures are logged, never thrown (a broken disk/DB must not kill the relay).
+ * The FileAdapter's write is atomic temp+rename and completes synchronously
+ * inside the returned promise, so awaiting it on shutdown is exact.
+ */
+function persistDoc(doc) {
+  let update
   try {
-    const buf = fs.readFileSync(file)
-    if (buf.length > 0) {
-      Y.applyUpdate(doc, new Uint8Array(buf), 'persistence')
-      return true
-    }
+    update = Y.encodeStateAsUpdate(doc)
   } catch (err) {
-    if (err && err.code !== 'ENOENT') {
-      console.error(`[persist] failed to load ${file}:`, err.message)
-    }
+    console.error(`[persist] failed to encode ${doc.name}:`, err && err.message)
+    return Promise.resolve()
   }
-  return false
+  return storage.save(doc.name, update).catch((err) => {
+    console.error(`[persist] failed to write snapshot ${doc.name}:`, err && err.message)
+  })
 }
 
-/** Atomic write: temp file + rename, so a crash mid-write never truncates state. */
-function writeSnapshot(room, doc) {
-  const file = snapshotPath(room)
-  const tmp = `${file}.${process.pid}.tmp`
-  try {
-    const update = Y.encodeStateAsUpdate(doc)
-    fs.writeFileSync(tmp, Buffer.from(update))
-    fs.renameSync(tmp, file)
-  } catch (err) {
-    console.error(`[persist] failed to write ${file}:`, err && err.message)
-    try {
-      fs.rmSync(tmp, { force: true })
-    } catch {
-      /* ignore cleanup failure */
-    }
-  }
-}
-
-/** Load every previously-persisted room on boot (load-on-boot). */
-function preloadRooms() {
-  ensureDataDir()
-  const cutoff = Date.now() - SNAPSHOT_MAX_AGE_DAYS * 86_400_000
-  let pruned = 0
+/** Prune aged snapshots, then load every surviving room on boot (load-on-boot). */
+async function preloadRooms() {
+  const pruned = await storage.prune(SNAPSHOT_MAX_AGE_DAYS * 86_400_000)
+  console.log(`[persist] pruned ${pruned} snapshot(s) older than ${SNAPSHOT_MAX_AGE_DAYS} day(s)`)
   let loaded = 0
-  for (const entry of fs.readdirSync(DATA_DIR)) {
-    if (!entry.endsWith('.yss')) continue
-    const file = path.join(DATA_DIR, entry)
-    try {
-      if (fs.statSync(file).mtimeMs < cutoff) {
-        fs.rmSync(file, { force: true })
-        pruned++
-        continue
-      }
-    } catch {
-      /* stat/unlink race — fall through and try to preload */
-    }
-    const room = entry.slice(0, -'.yss'.length)
-    getRoomDoc(room)
+  for (const room of await storage.listRooms()) {
+    await getRoomDoc(room)
     loaded++
   }
-  console.log(`[persist] pruned ${pruned} snapshot(s) older than ${SNAPSHOT_MAX_AGE_DAYS} day(s)`)
   return loaded
 }
 
@@ -211,33 +194,59 @@ class WSSharedDoc extends Y.Doc {
   }
 }
 
+/** name -> Promise<WSSharedDoc> for rooms whose snapshot load is in flight. */
+const docsLoading = new Map()
+
+/**
+ * Get (or create+hydrate) a room's doc. Async because the StorageAdapter's
+ * `load` is async; concurrent callers for the same room share ONE in-flight
+ * load (the promise cache) so two near-simultaneous connections can never
+ * spawn two divergent docs for one room.
+ */
 function getRoomDoc(name) {
-  let doc = docs.get(name)
-  if (doc) return doc
-  doc = new WSSharedDoc(name)
-  loadSnapshot(name, doc)
-  docs.set(name, doc)
-  return doc
+  const existing = docs.get(name)
+  if (existing) return Promise.resolve(existing)
+  let loading = docsLoading.get(name)
+  if (!loading) {
+    loading = (async () => {
+      const doc = new WSSharedDoc(name)
+      try {
+        const snap = await storage.load(name)
+        if (snap && snap.length > 0) {
+          Y.applyUpdate(doc, snap, 'persistence')
+        }
+      } catch (err) {
+        console.error(`[persist] failed to load snapshot ${name}:`, err && err.message)
+      }
+      docs.set(name, doc)
+      return doc
+    })()
+    docsLoading.set(name, loading)
+    loading.finally(() => docsLoading.delete(name))
+  }
+  return loading
 }
 
 function schedulePersist(doc) {
   if (doc._persistTimer) return // a write is already scheduled within the window
   doc._persistTimer = setTimeout(() => {
     doc._persistTimer = null
-    writeSnapshot(doc.name, doc)
+    persistDoc(doc)
   }, PERSIST_DEBOUNCE_MS)
   // Do not keep the event loop alive solely for a pending snapshot.
   if (typeof doc._persistTimer.unref === 'function') doc._persistTimer.unref()
 }
 
-function flushAllSnapshots() {
+async function flushAllSnapshots() {
+  const writes = []
   for (const doc of docs.values()) {
     if (doc._persistTimer) {
       clearTimeout(doc._persistTimer)
       doc._persistTimer = null
     }
-    writeSnapshot(doc.name, doc)
+    writes.push(persistDoc(doc))
   }
+  await Promise.all(writes)
 }
 
 /**
@@ -291,7 +300,7 @@ function compactRoomDoc(room, { force = false } = {}) {
     })
   }
 
-  writeSnapshot(name, fresh)
+  persistDoc(fresh)
   console.log(
     `[compact] ${name} → epoch ${epoch}: kept ${stats.itemsKept} item(s), ` +
     `dropped ${stats.tombstonesDropped} tombstone(s), deltas ${stats.deltasBefore}→${stats.deltasAfter}`
@@ -404,13 +413,31 @@ function onMessage(conn, doc, data) {
  * Hand-rolled setupWSConnection: wire a freshly-accepted socket to its room
  * doc, install the keepalive, and kick off the sync handshake (step1 + current
  * awareness) so the client immediately reconciles.
+ *
+ * Async because the room doc may need hydrating from the StorageAdapter. The
+ * message listener is attached BEFORE the load is awaited and buffers anything
+ * an eager client sends (its SyncStep1 typically races the load) so no wire
+ * message is ever dropped; the backlog drains right after the handshake.
  */
-function setupWSConnection(conn, room) {
+async function setupWSConnection(conn, room) {
   conn.binaryType = 'arraybuffer'
-  const doc = getRoomDoc(room)
-  doc.conns.set(conn, new Set())
 
-  conn.on('message', (data) => onMessage(conn, doc, new Uint8Array(data)))
+  let doc = null
+  const backlog = []
+  conn.on('message', (data) => {
+    const bytes = new Uint8Array(data)
+    if (doc) onMessage(conn, doc, bytes)
+    else backlog.push(bytes)
+  })
+
+  const loaded = await getRoomDoc(room)
+  if (conn.readyState !== WS_CONNECTING && conn.readyState !== WS_OPEN) {
+    // The socket died while the snapshot loaded; it was never registered on
+    // the doc, so there is nothing to clean up.
+    return
+  }
+  doc = loaded
+  doc.conns.set(conn, new Set())
 
   // --- keepalive: drop peers that stop responding to pings -------------------
   let pongReceived = true
@@ -459,6 +486,11 @@ function setupWSConnection(conn, room) {
       )
       send(doc, conn, encoding.toUint8Array(aEncoder))
     }
+  }
+
+  // Drain anything the client sent while the snapshot was loading.
+  for (const bytes of backlog.splice(0)) {
+    onMessage(conn, doc, bytes)
   }
 }
 
@@ -514,6 +546,31 @@ function sendJson(res, status, body) {
 
 const SNAPSHOT_RE = /^\/rooms\/([^/]+)\/snapshot\/?$/
 const COMPACT_RE = /^\/rooms\/([^/]+)\/compact\/?$/
+const KILL_CONNS_RE = /^\/rooms\/([^/]+)\/kill-conns\/?$/
+
+/**
+ * Test-only (SYNC_TEST_ENDPOINTS=1): abortively terminate every ws connection
+ * of a room. `terminate()` (not `close()`) drops the TCP socket with no close
+ * handshake — the closest scriptable stand-in for a network partition or a
+ * crashed middlebox. The socket's own 'close' event runs closeConn for the
+ * doc-map/awareness cleanup, exactly as a real drop would.
+ */
+function killRoomConns(room) {
+  const name = safeRoomName(room)
+  const doc = docs.get(name)
+  let killed = 0
+  if (doc) {
+    for (const conn of Array.from(doc.conns.keys())) {
+      killed++
+      try {
+        conn.terminate()
+      } catch {
+        /* already dead */
+      }
+    }
+  }
+  return { ok: true, room: name, killed }
+}
 
 function handleRequest(req, res) {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
@@ -537,6 +594,14 @@ function handleRequest(req, res) {
       const result = compactRoomDoc(room, { force: url.searchParams.get('force') === '1' })
       sendJson(res, result.ok ? 200 : 409, result)
       return
+    }
+    // Test-only socket kill (guarded — see killRoomConns above).
+    if (TEST_ENDPOINTS) {
+      const km = KILL_CONNS_RE.exec(url.pathname)
+      if (km) {
+        sendJson(res, 200, killRoomConns(decodeURIComponent(km[1])))
+        return
+      }
     }
     sendJson(res, 405, { error: 'method_not_allowed' })
     return
@@ -601,7 +666,14 @@ wss.on('connection', (conn, req) => {
   // compaction epoch is served state but its writes are discarded until it
   // rebases and reconnects (app/src/crdt/store.ts + crdt/rebase.ts).
   conn._declaredEpoch = Number.parseInt(url.searchParams.get('epoch') ?? '0', 10) || 0
-  setupWSConnection(conn, room)
+  setupWSConnection(conn, room).catch((err) => {
+    console.error('[ws] connection setup failed:', err && err.message)
+    try {
+      conn.close()
+    } catch {
+      /* already closing */
+    }
+  })
 })
 
 server.on('upgrade', (req, socket, head) => {
@@ -615,30 +687,42 @@ server.on('upgrade', (req, socket, head) => {
 // Boot
 // ---------------------------------------------------------------------------
 
-function boot() {
-  const preloaded = preloadRooms()
+async function boot() {
+  await storage.init()
+  const preloaded = await preloadRooms()
   server.listen(PORT, HOST, () => {
     console.log(`[sync] listening on http://${HOST}:${PORT}`)
     console.log(`[sync]   ws       ws://${HOST}:${PORT}/<room>`)
     console.log(`[sync]   health   http://${HOST}:${PORT}/health`)
     console.log(`[sync]   snapshot http://${HOST}:${PORT}/rooms/<room>/snapshot`)
-    console.log(`[sync]   data dir ${DATA_DIR}`)
+    console.log(`[sync]   storage  ${STORAGE_KIND}${STORAGE_KIND === 'file' ? ` (${DATA_DIR})` : ''}`)
     console.log(`[sync]   preloaded ${preloaded} room snapshot(s) on boot`)
   })
 }
 
-function shutdown(signal) {
+let shuttingDown = false
+async function shutdown(signal) {
+  if (shuttingDown) return
+  shuttingDown = true
   console.log(`[sync] ${signal} received — flushing snapshots and closing`)
-  flushAllSnapshots()
+  // Hard-stop if sockets (or a hung storage backend) linger.
+  setTimeout(() => process.exit(0), 2000).unref()
+  await flushAllSnapshots()
+  try {
+    await storage.close()
+  } catch {
+    /* pool teardown failure must not block exit */
+  }
   wss.close()
   server.close(() => process.exit(0))
-  // Hard-stop if sockets linger.
-  setTimeout(() => process.exit(0), 2000).unref()
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'))
 process.on('SIGTERM', () => shutdown('SIGTERM'))
 
-boot()
+boot().catch((err) => {
+  console.error('[sync] boot failed:', err && err.message)
+  process.exit(1)
+})
 
 export { exportItems, safeRoomName, WSSharedDoc, getRoomDoc, compactRoomDoc }

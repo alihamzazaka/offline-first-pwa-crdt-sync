@@ -1,0 +1,55 @@
+# CI for the offline-first PWA sync project (npm workspaces: app / server / e2e).
+#
+# What actually runs on every push / PR:
+#   1. `npm run test:fuzz`  — the two property-based CRDT fuzzers
+#      (crdt-convergence + epoch-compaction), pure `node --test`, no browser.
+#   2. `npm run test:e2e`   — the full Playwright suite. Playwright's own
+#      `webServer` array boots the sync server (:4444) and the Vite app
+#      (:5173), so no extra service steps are needed here.
+#
+# Honest status: this workflow is written and validated locally but has not
+# yet executed on a GitHub runner (repo not pushed at time of writing).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # Root package-lock.json covers all three workspaces.
+      - name: Install workspaces
+        run: npm ci
+
+      # @playwright/test is hoisted to the root node_modules by npm
+      # workspaces, so `npx playwright` resolves from the repo root.
+      - name: Install Playwright chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: CRDT convergence + epoch-compaction fuzzers
+        run: npm run test:fuzz
+
+      - name: Playwright concurrent-edit suite (2 chromium projects)
+        run: npm run test:e2e
+
+      # playwright.config.ts switches to the html reporter when CI=1;
+      # the report lands next to the config, in e2e/.
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/
+          retention-days: 14

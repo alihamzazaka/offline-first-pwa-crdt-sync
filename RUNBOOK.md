@@ -132,7 +132,7 @@ isolated A/B (and C) browser contexts and a unique sync room.
 Expected output (abridged, all green):
 
 ```
-Running 16 tests using 2 workers
+Running 26 tests using 2 workers
 
   ✓ same-field-concurrent-edit.spec.ts:… same-field concurrent edit converges to one defined value
   ✓ different-field.spec.ts:…            different-field concurrent edits both survive
@@ -142,12 +142,18 @@ Running 16 tests using 2 workers
   ✓ three-way.spec.ts:…                  three clients + server converge to one identical state
   ✓ qty-concurrent-adjust.spec.ts:…      concurrent offline qty adjustments add up (+5 and +3 -> +8)
   ✓ cross-tab.spec.ts:…                  two tabs of one browser converge via shared IndexedDB (offline)
+  ✓ epoch-rebase.spec.ts:…               real modules: sealEpoch collapses + GCs, adoptServerEpoch replays…
+  ✓ epoch-rebase.spec.ts:…               S8: offline edits across a compaction seal — clients rebase…
+  ✓ lossy-network.spec.ts:…              NET1: real network offline during edits on both clients, then heal…
+  ✓ lossy-network.spec.ts:…              NET2: repeated abortive socket kills during rapid concurrent edits…
+  ✓ lossy-network.spec.ts:…              NET3: high-latency network (CDP emulation) + a mid-burst socket kill…
 
-  16 passed (…s)
+  26 passed (…s)
 ```
 
-> 8 specs × 2 chromium projects = **16 test runs**. Each maps 1:1 to a scenario
-> in [docs/04-data-and-datasets.md](docs/04-data-and-datasets.md) and asserts
+> 13 tests (11 spec files) × 2 chromium projects = **26 test runs**. Each maps
+> to a scenario in [docs/04-data-and-datasets.md](docs/04-data-and-datasets.md)
+> (S1–S8) or the Phase-2 adversarial NET catalogue (§4e) and asserts
 > **convergence across all replicas (clients + server)** plus its guarantee.
 
 Useful variants:
@@ -196,6 +202,81 @@ Env vars (server):
 
 Proof: `fuzz/epoch-compaction.fuzz.mjs` (800 histories) +
 `e2e/specs/epoch-rebase.spec.ts` (real modules + full-stack S8).
+
+## 4d. Pluggable snapshot persistence (Phase 2 · v2.0 · F3)
+
+Room snapshots are written through a **StorageAdapter**
+(`server/src/storage.mjs`). The default is the v1.0 file backend — nothing to
+configure, byte-identical behaviour (`server/data/<room>.yss`, atomic
+temp+rename, prune/load on boot). Setting `SYNC_STORAGE=postgres` upserts the
+same `encodeStateAsUpdate` blob into a `yss_snapshots` table instead:
+
+```bash
+# default — file snapshots, exactly as v1.0:
+npm run dev:server
+
+# Postgres-backed snapshots (table is created on boot if missing):
+SYNC_STORAGE=postgres SYNC_PG_URL=postgres://user:pass@127.0.0.1:5432/inventory npm run dev:server
+
+# adapter unit tests (FileAdapter vs a temp dir; PostgresAdapter vs a fake client):
+npm run test:storage
+```
+
+Env vars (server persistence):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `SYNC_STORAGE` | `file` | snapshot backend: `file` \| `postgres` |
+| `SYNC_PG_URL` | — | Postgres connection string (required when `SYNC_STORAGE=postgres`) |
+| `SYNC_DATA_DIR` | `server/data` | snapshot directory for the `file` backend |
+| `SYNC_PERSIST_MS` | `750` | debounce window — a burst of edits costs one snapshot write |
+| `SNAPSHOT_MAX_AGE_DAYS` | `30` | snapshots untouched for longer are pruned on boot |
+| `SYNC_PG_TEST_URL` | — | test-only: enables the live-Postgres integration test in `server/test/storage.test.mjs` (skipped otherwise) |
+
+> Honest status: the Postgres adapter's SQL/upsert contract is unit-tested
+> against a fake query client; it has not been exercised against a live
+> Postgres on this machine (none reachable). Point `SYNC_PG_TEST_URL` at a real
+> DB to run the skipped integration test.
+
+## 4e. Adversarial lossy-network spec (Phase 2 · v2.0 · F2)
+
+Every other spec toggles connectivity deterministically through the in-app
+`OfflineToggle` (`provider.disconnect()`).
+[`e2e/specs/lossy-network.spec.ts`](e2e/specs/lossy-network.spec.ts) is the
+hostile counterpart — the network itself misbehaves, and the SAME all-replica
+convergence assertion must still hold:
+
+- **NET1 — real offline.** `context.setOffline(true)` on both clients plus a
+  server-side socket kill, concurrent edits, heal → convergence, zero lost
+  writes. The spec asserts *server-side* that no write leaked through the
+  partition before healing.
+- **NET2 — socket kills mid-sync.** 24 rapid concurrent edits per client while
+  every ws connection of the room is abortively `terminate()`d six times;
+  the y-websocket reconnect + Yjs state-vector handshake must recover exactly
+  the missing updates (last name edit wins, all 24 qty increments survive).
+- **NET3 — high latency.** CDP `Network.emulateNetworkConditions` (500 ms RTT)
+  with a mid-burst kill so the reconnect handshake runs under the emulated
+  conditions, converging while still throttled.
+
+```bash
+npx playwright test lossy-network                    # 3 tests × 2 projects = 6 runs
+npx playwright test lossy-network --repeat-each=5    # flake budget: expect 30/30
+```
+
+The socket kill uses a **test-only** endpoint the Playwright config enables via
+`SYNC_TEST_ENDPOINTS=1` — it is OFF by default so a deployed relay never
+exposes a remote kill switch:
+
+```bash
+# only with SYNC_TEST_ENDPOINTS=1 on the server:
+curl -X POST http://127.0.0.1:4444/rooms/<room>/kill-conns   # -> { killed: N }
+```
+
+Honest scoping (documented in the spec header): Chromium's network emulation
+does not reliably sever or throttle an **already-established** WebSocket —
+that is exactly why NET1 pairs `setOffline` with the kill endpoint (emulation
+then blocks every reconnect until heal) and NET3 kills mid-burst so the
+handshake actually runs under the emulated latency.
 
 ## 5. Production build / offline-shell check (optional)
 

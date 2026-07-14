@@ -2,21 +2,23 @@
   "name": "@offline-inventory/server",
   "private": true,
   "version": "1.0.0",
-  "description": "Hand-rolled y-websocket sync relay for the offline-first inventory PWA: CRDT convergence, debounced file-based Y.Doc snapshot persistence, /health, and a REST snapshot export. Pure JS, no native deps.",
+  "description": "Hand-rolled y-websocket sync relay for the offline-first inventory PWA: CRDT convergence, debounced Y.Doc snapshot persistence through a pluggable StorageAdapter (file | postgres), /health, and a REST snapshot export. Pure JS, no native deps beyond the optional pg driver.",
   "type": "module",
   "main": "src/index.mjs",
   "scripts": {
     "dev": "node src/index.mjs",
-    "start": "node src/index.mjs"
+    "start": "node src/index.mjs",
+    "test": "node --test test/storage.test.mjs"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
     "lib0": "^0.2.99",
+    "pg": "^8.22.0",
+    "ws": "^8.18.0",
     "y-protocols": "^1.0.6",
     "y-websocket": "^2.0.4",
-    "ws": "^8.18.0",
     "yjs": "^13.6.20"
   }
 }

@@ -16,7 +16,8 @@
     "test:e2e": "npm run test --workspace=e2e",
     "test:fuzz": "node --test fuzz/crdt-convergence.fuzz.mjs fuzz/epoch-compaction.fuzz.mjs",
     "test:fuzz:epoch": "node --test fuzz/epoch-compaction.fuzz.mjs",
-    "test": "npm run test:fuzz && npm run test:e2e"
+    "test:storage": "node --test server/test/storage.test.mjs",
+    "test": "npm run test:fuzz && npm run test:storage && npm run test:e2e"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",
