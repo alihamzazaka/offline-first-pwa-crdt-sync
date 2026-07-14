@@ -37,7 +37,8 @@ import { IndexeddbPersistence } from 'y-indexeddb'
 import { WebsocketProvider } from 'y-websocket'
 import { ROOM, WS_URL } from '../lib/room'
 import { ulid } from '../lib/ulid'
-import { markAllSynced, pendingCount } from '../queue/mutationLog'
+import { markAllSynced, pendingCount, pendingOpsInOrder } from '../queue/mutationLog'
+import { rebaseOntoBase, type RebaseResult } from './rebase'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -105,8 +106,57 @@ export const items = doc.getMap<ItemYMap>('items')
 
 export const persistence = new IndexeddbPersistence(`inv-${ROOM}`, doc)
 
+// --- Epoch protocol state (Phase 2 · v2.0) ----------------------------------
+// The server periodically seals the room into a new EPOCH (compaction: qty
+// deltas collapsed, aged tombstones GC'd — server/src/compaction.mjs). A client
+// holding pre-seal state must REBASE, not merge (crdt/rebase.ts explains why).
+// The pieces here:
+//   - localStorage[EPOCH_LS_KEY]  = the epoch this client last ADOPTED. It is
+//     declared to the server as a ws query param; the server discards sync
+//     writes from clients declaring an older epoch (stale-writer guard).
+//   - localStorage[REBASE_FLAG]   = set when an epoch advance is detected;
+//     the local doc + its IndexedDB copy are discarded and the page reloads.
+//     On the flagged boot, the fresh doc syncs the server's base and ONLY the
+//     journal's pending (un-synced) ops are replayed onto it via rebase.ts —
+//     ops touching items the seal collected are dropped (never resurrected).
+const EPOCH_LS_KEY = `inv-epoch-${ROOM}`
+const REBASE_FLAG = `inv-rebase-${ROOM}`
+/** Cross-tab control message: tells sibling tabs to run the same rebase. */
+const EPOCH_REBASE_SIGNAL = 'epoch-rebase'
+
+function storedEpoch(): number {
+  const n = Number(localStorage.getItem(EPOCH_LS_KEY) ?? '0')
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+function setStoredEpoch(e: number): void {
+  localStorage.setItem(EPOCH_LS_KEY, String(e))
+}
+
+type EpochState = 'normal' | 'rebase-boot' | 'reloading'
+let epochState: EpochState =
+  localStorage.getItem(REBASE_FLAG) === '1' ? 'rebase-boot' : 'normal'
+let lastRebase: RebaseResult | null = null
+/** True until the first completed sync handshake of this page load. */
+let firstHandshake = true
+/** Set once the IndexedDB copy has loaded; used to spot fresh replicas. */
+let localDocReady = false
+let hadLocalState = false
+
+void persistence.whenSynced.then(() => {
+  hadLocalState = items.size > 0
+  localDocReady = true
+})
+
+/**
+ * MUTABLE ws params: y-websocket's `url` is a getter that re-encodes `params`
+ * on every (re)connect, so updating `epoch` here re-declares this client to
+ * the server after it adopts a new epoch.
+ */
+const wsParams = { epoch: String(storedEpoch()) }
+
 export const provider = new WebsocketProvider(WS_URL, ROOM, doc, {
-  connect: true
+  connect: true,
+  params: wsParams
 })
 
 // --- Cross-tab bridge (documented above) -----------------------------------
@@ -118,6 +168,12 @@ if (bc) {
     if (origin !== BC_ORIGIN) bc.postMessage(update)
   })
   bc.onmessage = (e: MessageEvent) => {
+    // Control message: a sibling tab detected an epoch advance — this tab's
+    // in-memory doc is equally stale and must not keep re-persisting it.
+    if (e.data === EPOCH_REBASE_SIGNAL) {
+      startEpochRebase()
+      return
+    }
     const u8 = e.data instanceof Uint8Array ? e.data : new Uint8Array(e.data as ArrayBuffer)
     Y.applyUpdate(doc, u8, BC_ORIGIN)
   }
@@ -145,12 +201,105 @@ provider.on('status', (event: { status: WsStatus }) => {
 
 provider.on('sync', (isSynced: boolean) => {
   setStatus({ synced: isSynced })
-  if (isSynced) {
-    // The server acknowledged/absorbed our state — the journal's pending ops
-    // are now durable server-side. (Journal is evidence, Yjs is authority.)
-    void markAllSynced()
+  if (isSynced) handleSynced()
+})
+
+// ---------------------------------------------------------------------------
+// Epoch state machine (Phase 2 · v2.0) — see the block comment above wsParams.
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs on every completed sync handshake. Decides between three outcomes:
+ *  - flagged boot        → finish the rebase (replay pending onto the base),
+ *  - server epoch ahead  → start a rebase (this doc holds pre-seal state),
+ *  - epochs match        → normal path: journal ops are durable server-side.
+ */
+function handleSynced(): void {
+  if (epochState === 'reloading') return
+  if (epochState === 'rebase-boot') {
+    finishRebaseBoot()
+    return
+  }
+  const current = getEpoch()
+  const stored = storedEpoch()
+  if (current > stored) {
+    // A fresh replica (empty local doc on this boot's first handshake) merged
+    // the base into nothing — there is no pre-seal state to shed, so it may
+    // adopt in place. Anything else must discard its doc and rebase.
+    if (firstHandshake && localDocReady && !hadLocalState) {
+      firstHandshake = false
+      adoptEpochInPlace(current)
+      return
+    }
+    startEpochRebase()
+    return
+  }
+  firstHandshake = false
+  if (current > 0) setStoredEpoch(current)
+  wsParams.epoch = String(current)
+  // The server accepted our state on a current-epoch connection — the
+  // journal's pending ops are now durable server-side. (On a STALE connection
+  // the server discards our writes, so this must not run in that case.)
+  void markAllSynced()
+}
+
+/** Adopt without a reload — only safe for a replica with no pre-seal state. */
+function adoptEpochInPlace(epoch: number): void {
+  setStoredEpoch(epoch)
+  wsParams.epoch = String(epoch)
+  // Reconnect so the server sees the adopted epoch and accepts our writes
+  // (the current connection declared the old epoch and is read-only).
+  provider.disconnect()
+  provider.connect()
+}
+
+/**
+ * The server sealed a newer epoch than this doc carries. Discard the local
+ * doc (its structs are pre-seal: merging them back would resurrect collected
+ * items and collide with the sealed containers), then reload; the flagged
+ * boot adopts the base and replays ONLY the journal's pending ops.
+ */
+function startEpochRebase(): void {
+  if (epochState !== 'normal') return
+  epochState = 'reloading'
+  localStorage.setItem(REBASE_FLAG, '1')
+  bc?.postMessage(EPOCH_REBASE_SIGNAL)
+  provider.disconnect()
+  void persistence.clearData().then(() => window.location.reload())
+}
+
+/** Flagged boot, first handshake done: the doc now holds exactly the server's
+ * epoch base. Replay pending journal ops through rebase.ts (drop-not-resurrect),
+ * adopt the epoch, and reconnect declaring it so our writes are accepted. */
+function finishRebaseBoot(): void {
+  epochState = 'reloading' // block re-entry while the async replay runs
+  void (async () => {
+    const fromEpoch = storedEpoch()
+    const pending = await pendingOpsInOrder()
+    lastRebase = rebaseOntoBase(doc, pending)
+    lastRebase.fromEpoch = fromEpoch
+    const adopted = getEpoch()
+    setStoredEpoch(adopted)
+    localStorage.removeItem(REBASE_FLAG)
+    wsParams.epoch = String(adopted)
+    epochState = 'normal'
+    provider.disconnect()
+    provider.connect() // fresh handshake ships the replayed ops + drains journal
+  })()
+}
+
+// A mid-session epoch bump (forced compaction while connected) arrives as a
+// normal update to the meta map — catch it outside the handshake path too.
+doc.getMap('meta').observe(() => {
+  if (epochState === 'normal' && !firstHandshake && getEpoch() > storedEpoch()) {
+    startEpochRebase()
   }
 })
+
+/** Result of the last completed rebase this page load (test/debug surface). */
+export function getLastRebase(): RebaseResult | null {
+  return lastRebase
+}
 
 export function getStatus(): SyncStatus {
   return statusCache
@@ -365,6 +514,7 @@ declare global {
       getStatus: () => SyncStatus
       getPending: () => Promise<number>
       getEpoch: () => number
+      getLastRebase: () => RebaseResult | null
       setOffline: (off: boolean) => void
       /** Idempotent journal replay (S3 proof). Dynamic import avoids a static store↔ops cycle. */
       replay: () => Promise<{ applied: number; skipped: number }>
@@ -379,6 +529,7 @@ window.__inv = {
   getStatus,
   getPending: pendingCount,
   getEpoch,
+  getLastRebase,
   setOffline,
   replay: async () => (await import('./ops')).replayJournal()
 }

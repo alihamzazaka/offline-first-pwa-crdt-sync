@@ -92,6 +92,15 @@ export function allOpsInOrder(): Promise<JournalEntry[]> {
   return journal.ops.orderBy('opId').toArray()
 }
 
+/**
+ * Pending (un-synced) ops in append order — the epoch-rebase replay set.
+ * After the server seals a new epoch, ONLY these are replayed onto the adopted
+ * base (crdt/rebase.ts); already-synced ops are folded into the base itself.
+ */
+export function pendingOpsInOrder(): Promise<JournalEntry[]> {
+  return journal.ops.where('synced').equals(0).sortBy('opId')
+}
+
 /** Live subscription to the pending-op count. Returns an unsubscribe fn. */
 export function subscribePendingCount(cb: (n: number) => void): () => void {
   const sub = liveQuery(() => journal.ops.where('synced').equals(0).count()).subscribe({

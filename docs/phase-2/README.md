@@ -10,10 +10,16 @@
 
 ---
 
-## ⚠️ Status banner — planned, not yet built
+## ⚠️ Status banner — F1 built; F2–F4 planned
 
-**Everything in `docs/phase-2/` is a PLAN for the next phase. None of the four
-v2.0 features is implemented yet.** This suite is written to the same standard as
+**F1 (epoch compaction + rebase) is now IMPLEMENTED and wired end-to-end**:
+`server/src/compaction.mjs` (seal: collapse qty deltas, GC aged tombstones),
+the server stale-writer guard + `POST /rooms/:room/compact` (`server/src/index.mjs`),
+the client epoch state machine + pending-op rebase (`app/src/crdt/store.ts`,
+`app/src/crdt/rebase.ts`) — proven by an 800-history fuzzer
+(`fuzz/epoch-compaction.fuzz.mjs`) and a full-stack browser scenario
+(`e2e/specs/epoch-rebase.spec.ts`, S8; suite 20/20 green). **F2–F4 remain a
+PLAN.** This suite is written to the same standard as
 the Phase 1 docs — it distinguishes *built* from *planned*, quotes the real,
 measured v1.0 baseline, and states concrete target numbers — but the targets are
 **targets**, not results. The only measured numbers in this suite are the v1.0
@@ -58,7 +64,7 @@ the whole repository.
 
 | Axis | v1.0 — built & proven | v2.0 — planned |
 |---|---|---|
-| **CRDT growth (F1)** | `qty` delta array + tombstones retained for the life of the room; `data/<room>.yss` grows monotonically | **Server-side epoch-checkpoint compaction** collapses each item's deltas to one base entry and drops aged tombstones; a long-offline client past the horizon **rebases, never resurrects** |
+| **CRDT growth (F1)** | `qty` delta array + tombstones retained for the life of the room; `data/<room>.yss` grows monotonically | ✅ **BUILT** — server-side epoch-checkpoint compaction collapses each item's deltas to one base entry and drops aged tombstones; a long-offline client past the horizon **rebases, never resurrects** (fuzzer + S8 e2e proven) |
 | **Test fidelity (F2)** | Deterministic `provider.disconnect()` via `OfflineToggle`; 8 specs × 2 chromium projects = **16/16 green** | A **second Playwright project** using real `context.setOffline`, CDP throttling, and `routeWebSocket` **socket kills mid-`SyncStep2`** — convergence must survive *interrupted* sync |
 | **Persistence (F3)** | Single-process debounced file snapshot (`Y.encodeStateAsUpdate` → `data/<room>.yss`, atomic temp+rename, load-on-boot) | A **pluggable `StorageAdapter`** (`file` \| `postgres` \| `mysql`) writing the **same** `encodeStateAsUpdate` blob — aligns with the SPEC's named authoritative DB and opens the path to multi-instance |
 | **Background sync (F4)** | `y-websocket` reconnect **while the tab is open** only | A genuine **Workbox `BackgroundSyncPlugin`** queue so offline edits retry **after the tab closes** — or an **honest README re-scope** if the browser support proves too thin |

@@ -55,7 +55,14 @@ export default defineConfig({
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
       stdout: 'pipe',
-      stderr: 'pipe'
+      stderr: 'pipe',
+      env: {
+        // Epoch-rebase spec: make tombstones instantly collectible so an
+        // explicit POST /rooms/:room/compact GCs them without waiting out the
+        // 7-day production horizon. Auto-compaction stays OFF, so every other
+        // spec sees an epoch-0 room and is unaffected.
+        SYNC_COMPACT_TOMBSTONE_MS: '0'
+      }
     },
     {
       command: 'npm run dev --workspace=app',

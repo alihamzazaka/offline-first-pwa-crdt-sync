@@ -68,21 +68,31 @@ Per the SPEC, the conflict model is a deliberate, documented choice:
 
 The next-phase suite targets the four most senior distributed-systems
 capabilities left in the repo. **(1) Server-side epoch compaction / GC is now
-built** ✅ — `server/src/compaction.mjs` seals a new epoch at a safe checkpoint
-(an idle room), collapsing every ever-growing qty-delta array to a single base
-delta and garbage-collecting tombstones past a horizon, while a pre-horizon
-client is forced to **rebase, not resurrect** (`app/src/crdt/rebase.ts`: adopt
-the epoch base, replay only pending journal ops, drop any that target a collected
-item). It is proven over **800 random seal/rebase histories + deterministic
-cases** in [`fuzz/epoch-compaction.fuzz.mjs`](fuzz/epoch-compaction.fuzz.mjs)
+built and wired end-to-end** ✅ — `server/src/compaction.mjs` seals a new epoch
+at a safe checkpoint (an idle room), collapsing every ever-growing qty-delta
+array to a single base delta and garbage-collecting tombstones past a horizon.
+A pre-horizon client is forced to **rebase, not resurrect**, and the whole wire
+protocol ships: the client declares its adopted epoch as a ws query param, the
+server's **stale-writer guard** serves state to — but discards writes from —
+pre-epoch connections (`server/src/index.mjs`), and on detecting the epoch
+advance the client discards its pre-seal doc and replays **only** its pending
+journal ops onto the adopted base, dropping any that target a collected item
+(`app/src/crdt/rebase.ts` + the epoch state machine in `app/src/crdt/store.ts`).
+Proven three ways: **800 random seal/rebase histories** in
+[`fuzz/epoch-compaction.fuzz.mjs`](fuzz/epoch-compaction.fuzz.mjs)
 (bounded-growth · value-preserving · no-resurrect · no-double-count ·
-convergence), and exposed as an admin `POST /rooms/:room/compact` plus opt-in
-idle auto-compaction (`SYNC_AUTO_COMPACT=1`). Still **planned**: (2) **adversarial
-lossy-network testing** (real offline, CDP throttling, socket-kill
-mid-`SyncStep2`), (3) a **pluggable Postgres/MySQL persistence adapter** past the
-single-process file snapshot, and (4) **real Background Sync** (Workbox) + a
-GitHub Actions **CI**. Baseline: 16/16 Playwright + (now) **4/4 fuzz suites**
-green. See [docs/phase-2/README.md](docs/phase-2/README.md).
+convergence), the **real shipped modules** executed in
+[`e2e/specs/epoch-rebase.spec.ts`](e2e/specs/epoch-rebase.spec.ts), and a
+**full-stack browser scenario (S8)** in the same spec — two live clients, a real
+`POST /rooms/:room/compact` seal while offline, reconnect, automatic rebase
+(clear + reload + pending replay), and convergence with the collected item gone
+and the pending edit preserved. Idle auto-compaction is opt-in
+(`SYNC_AUTO_COMPACT=1`). Known scoped limitation: simultaneous multi-tab rebase
+has a narrow re-persistence window (documented in `store.ts`). Still
+**planned**: (2) **adversarial lossy-network testing** (CDP throttling,
+socket-kill mid-`SyncStep2`), (3) a **pluggable Postgres/MySQL persistence
+adapter**, and (4) **real Background Sync** (Workbox) + GitHub Actions **CI**.
+See [docs/phase-2/README.md](docs/phase-2/README.md).
 
 ---
 
@@ -137,18 +147,21 @@ duplicates / tombstone / ordered replay / cross-tab).
 
 - **Run it:** see [RUNBOOK.md](RUNBOOK.md) — `npm install`,
   `npx playwright install chromium`, `npm run dev`, `npm run test:e2e`.
-- **The proof (examples):** `e2e/specs/` (8 specs → the 7 scenarios S1–S7 plus the
-  delta-counter money shot), run under two chromium projects.
+- **The proof (examples):** `e2e/specs/` (10 specs → scenarios S1–S8 including
+  the delta-counter money shot and the epoch-rebase full-stack scenario), run
+  under two chromium projects — **20/20 green**.
 - **The proof (property-based):** `fuzz/crdt-convergence.fuzz.mjs` — a
   Jepsen-style fuzzer that generates **1500 random operation histories** (random
   adjust/update/delete interleaved with random partition/heal points across 3
   replicas) and asserts the three invariants on every one: **convergence**,
-  **qty = sum of applied deltas** (anti-LWW), and **tombstone**. The e2e suite
-  proves ~16 hand-picked scenarios; the fuzzer proves the same guarantees over
-  thousands of histories a human would never hand-write. Run `npm run test:fuzz`.
-  It also surfaced a genuine model property (documented in the file header):
-  *concurrent creates of the **same** id would discard one container's deltas —
-  the app avoids this by minting a fresh ULID per create, so ids never collide.*
+  **qty = sum of applied deltas** (anti-LWW), and **tombstone** — plus
+  `fuzz/epoch-compaction.fuzz.mjs`, **800 random seal/rebase histories** for the
+  Phase-2 compaction protocol (bounded-growth · value-preserving · no-resurrect
+  · no-double-count · convergence). Run `npm run test:fuzz`.
+  The convergence fuzzer also surfaced a genuine model property (documented in
+  the file header): *concurrent creates of the **same** id would discard one
+  container's deltas — the app avoids this by minting a fresh ULID per create,
+  so ids never collide.*
 - **Demo:** [demo/script.md](demo/script.md) — the 60-second concurrent-merge clip.
 
 ## Repository layout
@@ -168,8 +181,9 @@ duplicates / tombstone / ordered replay / cross-tab).
 │   └── src/
 │       ├── main.tsx          # entry: mounts App, wires the store, registers the SW
 │       ├── crdt/
-│       │   ├── store.ts      # the single Y.Doc: persistence, transports, snapshots, window.__inv
-│       │   └── ops.ts        # typed CRDT ops (create/update/adjustQty/delete/editNotes) + replayJournal
+│       │   ├── store.ts      # the single Y.Doc: persistence, transports, snapshots, epoch state machine, window.__inv
+│       │   ├── ops.ts        # typed CRDT ops (create/update/adjustQty/delete/editNotes) + replayJournal
+│       │   └── rebase.ts     # epoch rebase: adopt server base + replay pending, drop-not-resurrect (v2.0)
 │       ├── queue/
 │       │   └── mutationLog.ts# Dexie journal: visible offline queue + idempotent-replay evidence
 │       ├── lib/              # ulid.ts (stable op IDs) · room.ts (room/ws config)
@@ -177,12 +191,15 @@ duplicates / tombstone / ordered replay / cross-tab).
 │       └── ui/               # App, ItemList, ItemEditor, SyncStatusBar, ConflictLog, OfflineToggle
 ├── server/                   # the sync backend
 │   ├── package.json          # yjs · y-websocket · ws · y-protocols · lib0 (pure JS, no native deps)
-│   └── src/index.mjs         # hand-rolled setupWSConnection · data/<room>.yss snapshots · /health · REST
+│   └── src/
+│       ├── index.mjs         # hand-rolled setupWSConnection · stale-writer guard · snapshots · /health · REST · /compact
+│       └── compaction.mjs    # epoch seal: collapse qty deltas + GC aged tombstones (v2.0)
 ├── e2e/                      # the reproducible proof (example-based)
 │   ├── package.json          # @playwright/test
 │   ├── playwright.config.ts  # webServer array (sync server + vite) · two chromium projects
 │   ├── helpers/clients.ts    # isolated A/B contexts, offline toggle, CRUD, convergence assertions
-│   └── specs/                # one spec per scenario (S1–S7 + qty delta-counter)
+│   └── specs/                # one spec per scenario (S1–S8 + qty delta-counter + epoch-rebase)
 └── fuzz/                     # the reproducible proof (property-based)
-    └── crdt-convergence.fuzz.mjs  # 1500 random histories · convergence + qty-sum + tombstone
+    ├── crdt-convergence.fuzz.mjs  # 1500 random histories · convergence + qty-sum + tombstone
+    └── epoch-compaction.fuzz.mjs  # 800 random seal/rebase histories · bounded + no-resurrect (v2.0)
 ```

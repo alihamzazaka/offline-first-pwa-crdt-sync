@@ -162,6 +162,41 @@ npx playwright show-report               # open the HTML report after a run
 
 ---
 
+## 4b. Property-based fuzzers (no browser needed)
+
+```bash
+npm run test:fuzz          # both fuzzers: 1500 convergence + 800 seal/rebase histories
+npm run test:fuzz:epoch    # just the epoch-compaction fuzzer
+```
+
+## 4c. Epoch compaction (Phase 2 · v2.0)
+
+The server can seal a room into a new **epoch** — collapsing each item's
+qty-delta array to a single base entry and garbage-collecting tombstones past a
+horizon — while a client that was offline across the seal automatically
+**rebases** on reconnect (adopts the base, replays only its pending journal
+ops, drops ops on collected items; the UI reloads once).
+
+```bash
+# on-demand seal (refused with peers connected unless force=1):
+curl -X POST http://127.0.0.1:4444/rooms/<room>/compact
+curl -X POST "http://127.0.0.1:4444/rooms/<room>/compact?force=1"
+
+# room epoch is visible in the REST snapshot:
+curl http://127.0.0.1:4444/rooms/<room>/snapshot   # -> { epoch, items, ... }
+```
+
+Env vars (server):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `SYNC_AUTO_COMPACT` | off | `1` = auto-seal an idle room when there is enough to shed |
+| `SYNC_COMPACT_TOMBSTONE_MS` | 7 days | tombstones older than this are GC'd on seal |
+| `SYNC_COMPACT_MIN_PRESSURE` | 64 | min shedable entries before an idle auto-seal fires |
+
+Proof: `fuzz/epoch-compaction.fuzz.mjs` (800 histories) +
+`e2e/specs/epoch-rebase.spec.ts` (real modules + full-stack S8).
+
 ## 5. Production build / offline-shell check (optional)
 
 The service worker is intentionally **off in `vite dev`** (the suite proves sync

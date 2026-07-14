@@ -44,7 +44,7 @@ import * as syncProtocol from 'y-protocols/sync'
 import * as awarenessProtocol from 'y-protocols/awareness'
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
-import { sealEpoch, compactionPressure } from './compaction.mjs'
+import { sealEpoch, compactionPressure, readEpoch } from './compaction.mjs'
 
 // ---------------------------------------------------------------------------
 // Config
@@ -354,11 +354,29 @@ function onMessage(conn, doc, data) {
     switch (messageType) {
       case MESSAGE_SYNC: {
         encoding.writeVarUint(encoder, MESSAGE_SYNC)
-        // readSyncMessage applies incoming step2/updates to `doc` and writes
-        // any needed reply (e.g. a step2 in response to the client's step1)
-        // into `encoder`. `conn` is the transaction origin so our own update
-        // handler does not echo it straight back to the sender.
-        syncProtocol.readSyncMessage(decoder, encoder, doc, conn)
+        // --- Epoch stale-writer guard (Phase 2 · v2.0) ----------------------
+        // A client that declared an OLDER epoch than the room's current one
+        // (ws query param `?epoch=N`, see app/src/crdt/store.ts) still holds
+        // pre-seal CRDT structs. Applying its SyncStep2/Update would resurrect
+        // items the seal garbage-collected and register-collide with the
+        // sealed containers (the exact hazards compaction.mjs documents). So a
+        // stale connection is READ-ONLY for sync: we still answer its Step1
+        // (it must receive the base to detect the epoch advance and rebase),
+        // but its Step2/Update messages are discarded. After the client-side
+        // rebase it reconnects declaring the adopted epoch and writes flow.
+        if ((conn._declaredEpoch ?? 0) < readEpoch(doc)) {
+          const syncType = decoding.readVarUint(decoder)
+          if (syncType === syncProtocol.messageYjsSyncStep1) {
+            syncProtocol.readSyncStep1(decoder, encoder, doc)
+          }
+          // messageYjsSyncStep2 / messageYjsUpdate: dropped on purpose.
+        } else {
+          // readSyncMessage applies incoming step2/updates to `doc` and writes
+          // any needed reply (e.g. a step2 in response to the client's step1)
+          // into `encoder`. `conn` is the transaction origin so our own update
+          // handler does not echo it straight back to the sender.
+          syncProtocol.readSyncMessage(decoder, encoder, doc, conn)
+        }
         if (encoding.length(encoder) > 1) {
           send(doc, conn, encoding.toUint8Array(encoder))
         }
@@ -555,6 +573,7 @@ function handleRequest(req, res) {
     sendJson(res, 200, {
       room,
       exists: Boolean(doc),
+      epoch: doc ? readEpoch(doc) : 0,
       count: items.length,
       items
     })
@@ -577,6 +596,11 @@ wss.on('connection', (conn, req) => {
   // Canonicalize once at the entry point so the live doc-map key, the snapshot
   // filename, and the preload key all agree ("a/b" and "a_b" map to one room).
   const room = safeRoomName(decodeURIComponent(url.pathname.slice(1).split('/')[0]))
+  // Epoch the client last adopted (`?epoch=N`, default 0). Drives the
+  // stale-writer guard in onMessage; a peer that predates the room's current
+  // compaction epoch is served state but its writes are discarded until it
+  // rebases and reconnects (app/src/crdt/store.ts + crdt/rebase.ts).
+  conn._declaredEpoch = Number.parseInt(url.searchParams.get('epoch') ?? '0', 10) || 0
   setupWSConnection(conn, room)
 })
 

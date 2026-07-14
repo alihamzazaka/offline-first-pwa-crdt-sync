@@ -35,9 +35,15 @@
  * item is gone.
  *
  * This module is PURE — it operates on Y.Docs and journal entries and returns
- * counts. The store wires it in on reconnect (see rebaseIfNeeded below); the
+ * counts. crdt/store.ts wires it in: detecting a server epoch ahead of the
+ * client's triggers `startEpochRebase` (discard the local doc + IndexedDB copy,
+ * reload), and the flagged boot calls `rebaseOntoBase` below to replay the
+ * journal's pending ops onto the freshly-synced base — while the server-side
+ * stale-writer guard (server/src/index.mjs) discards sync writes from
+ * pre-epoch connections so the pre-seal doc can never pollute the room. The
  * algorithm is proven over thousands of histories in
- * fuzz/epoch-compaction.fuzz.mjs.
+ * fuzz/epoch-compaction.fuzz.mjs and end-to-end (real browsers, real server,
+ * real seal) in e2e/specs/epoch-rebase.spec.ts.
  */
 
 import * as Y from 'yjs'
