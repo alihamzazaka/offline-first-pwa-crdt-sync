@@ -75,6 +75,20 @@ export default defineConfig({
       timeout: 120_000,
       stdout: 'pipe',
       stderr: 'pipe'
+    },
+    {
+      // Built + previewed app on :5174 — the SW (and Background Sync, F4) is
+      // ONLY emitted for production builds (devOptions.enabled=false), so the
+      // dev server on :5173 cannot exercise it. background-sync.spec.ts targets
+      // this origin explicitly; every other spec keeps using the dev server.
+      command:
+        'npm run build --workspace=app && npm run preview --workspace=app -- --port 5174 --strictPort',
+      cwd: '..',
+      url: 'http://127.0.0.1:5174/',
+      reuseExistingServer: !process.env.CI,
+      timeout: 180_000,
+      stdout: 'pipe',
+      stderr: 'pipe'
     }
   ]
 })

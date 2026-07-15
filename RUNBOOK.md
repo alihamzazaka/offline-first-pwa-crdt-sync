@@ -148,13 +148,16 @@ Running 26 tests using 2 workers
   ✓ lossy-network.spec.ts:…              NET2: repeated abortive socket kills during rapid concurrent edits…
   ✓ lossy-network.spec.ts:…              NET3: high-latency network (CDP emulation) + a mid-burst socket kill…
 
-  26 passed (…s)
+  28 passed (…s)
 ```
 
-> 13 tests (11 spec files) × 2 chromium projects = **26 test runs**. Each maps
+> 14 tests (11 spec files) × 2 chromium projects = **28 test runs**. Each maps
 > to a scenario in [docs/04-data-and-datasets.md](docs/04-data-and-datasets.md)
-> (S1–S8) or the Phase-2 adversarial NET catalogue (§4e) and asserts
-> **convergence across all replicas (clients + server)** plus its guarantee.
+> (S1–S8), the Phase-2 adversarial NET catalogue (§4e), or the F4 Background
+> Sync scenario (offline mutations replay to the server over HTTP after the tab
+> would close — `background-sync.spec.ts`, run against the built+previewed app
+> on :5174 where the service worker is emitted) and asserts **convergence across
+> all replicas (clients + server)** plus its guarantee.
 
 Useful variants:
 
@@ -218,8 +221,12 @@ npm run dev:server
 # Postgres-backed snapshots (table is created on boot if missing):
 SYNC_STORAGE=postgres SYNC_PG_URL=postgres://user:pass@127.0.0.1:5432/inventory npm run dev:server
 
-# adapter unit tests (FileAdapter vs a temp dir; PostgresAdapter vs a fake client):
+# adapter tests: FileAdapter vs a temp dir; PostgresAdapter vs a fake client
+# AND a live-DB integration pass running the real SQL against in-process PGlite:
 npm run test:storage
+
+# just the in-process-Postgres integration test:
+npm run test:storage:pg
 ```
 
 Env vars (server persistence):
@@ -231,12 +238,16 @@ Env vars (server persistence):
 | `SYNC_DATA_DIR` | `server/data` | snapshot directory for the `file` backend |
 | `SYNC_PERSIST_MS` | `750` | debounce window — a burst of edits costs one snapshot write |
 | `SNAPSHOT_MAX_AGE_DAYS` | `30` | snapshots untouched for longer are pruned on boot |
-| `SYNC_PG_TEST_URL` | — | test-only: enables the live-Postgres integration test in `server/test/storage.test.mjs` (skipped otherwise) |
+| `SYNC_PG_TEST_URL` | — | test-only: enables the EXTERNAL live-Postgres integration test in `server/test/storage.test.mjs` (skipped otherwise) |
 
-> Honest status: the Postgres adapter's SQL/upsert contract is unit-tested
-> against a fake query client; it has not been exercised against a live
-> Postgres on this machine (none reachable). Point `SYNC_PG_TEST_URL` at a real
-> DB to run the skipped integration test.
+> Honest status: the Postgres adapter's real SQL is now integration-tested
+> against an **in-process Postgres** — `server/test/storage.pg.test.mjs` runs the
+> actual `CREATE TABLE` / `INSERT … ON CONFLICT DO UPDATE` upsert / `SELECT` /
+> `make_interval` prune against **PGlite** (`@electric-sql/pglite`, Postgres
+> compiled to WASM), a genuine SQL round-trip with the bytea codec verified over
+> all 256 byte values. The `pg` **driver** wiring (real TCP `Pool`) is still only
+> unit-tested against a fake client; point `SYNC_PG_TEST_URL` at a real server to
+> also run the external round-trip.
 
 ## 4e. Adversarial lossy-network spec (Phase 2 · v2.0 · F2)
 

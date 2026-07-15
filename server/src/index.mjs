@@ -546,7 +546,174 @@ function sendJson(res, status, body) {
 
 const SNAPSHOT_RE = /^\/rooms\/([^/]+)\/snapshot\/?$/
 const COMPACT_RE = /^\/rooms\/([^/]+)\/compact\/?$/
+const OPS_RE = /^\/rooms\/([^/]+)\/ops\/?$/
 const KILL_CONNS_RE = /^\/rooms\/([^/]+)\/kill-conns\/?$/
+
+// ---------------------------------------------------------------------------
+// POST /rooms/:room/ops — HTTP replay of the client mutation journal (F4)
+// ---------------------------------------------------------------------------
+//
+// The offline-first client normally syncs over the ws relay. But a ws provider
+// only retries WHILE THE TAB IS OPEN. Phase 2 · F4 adds a genuine Background
+// Sync path: when the network is down the client POSTs its unsynced journal ops
+// here, the browser's Service Worker (workbox-background-sync — see
+// app/src/sw/service-worker.ts) queues the failed POST in IndexedDB, and the
+// SW replays it when connectivity returns — EVEN IF THE TAB HAS CLOSED.
+//
+// This endpoint is the server half: it applies a batch of {opId,type,payload,ts}
+// journal ops to the room doc IDEMPOTENTLY, reusing the exact epoch/rebase
+// semantics of app/src/crdt/rebase.ts (which the fuzzer + S8 already prove):
+//   - createItem  is idempotent by ULID (skip if the id exists),
+//   - adjustQty   is idempotent by the delta's opId (skip if already present),
+//   - every other op is a no-op if it would not change state (skip), and
+//   - for every op EXCEPT createItem a MISSING target item means the item was
+//     collected by an epoch seal, so the op is DROPPED — never resurrected
+//     (the same drop-not-resurrect rule readEpoch/compaction enforce for ws).
+// Applying through doc.transact fires the normal update handler, so any peers
+// still connected receive the replayed ops live and the snapshot is persisted.
+
+/** Read a JSON request body with a hard size cap. Rejects on malformed JSON. */
+function readJsonBody(req, maxBytes = 4 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0
+    const chunks = []
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > maxBytes) {
+        reject(new Error('request body too large'))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8')
+      if (!raw) return resolve({})
+      try {
+        resolve(JSON.parse(raw))
+      } catch {
+        reject(new Error('invalid JSON body'))
+      }
+    })
+    req.on('error', reject)
+  })
+}
+
+/**
+ * Re-apply ONE journal op onto the room's items map. Mirrors
+ * app/src/crdt/rebase.ts#reapplyPendingOp exactly (drop-not-resurrect for a
+ * collected item; idempotent by opId), so the HTTP replay path converges to the
+ * same state the ws path would. @returns {'applied'|'skipped'|'dropped'}
+ */
+function reapplyRemoteOp(items, op) {
+  const p = (op && op.payload) || {}
+  const ts = typeof op.ts === 'number' ? op.ts : Date.now()
+  switch (op.type) {
+    case 'createItem': {
+      const id = String(p.id ?? '')
+      if (!id || items.has(id)) return 'skipped'
+      const m = new Y.Map()
+      m.set('sku', String(p.sku ?? ''))
+      m.set('name', String(p.name ?? ''))
+      m.set('location', String(p.location ?? ''))
+      m.set('deleted', false)
+      m.set('createdAt', ts)
+      m.set('lastCounted', null)
+      const notes = new Y.Text()
+      if (typeof p.notes === 'string' && p.notes) notes.insert(0, p.notes)
+      m.set('notes', notes)
+      const qty = new Y.Array()
+      const initialQty = typeof p.qty === 'number' ? p.qty : 0
+      if (initialQty !== 0) qty.push([{ d: initialQty, op: op.opId, ts }])
+      m.set('qty', qty)
+      items.set(id, m)
+      return 'applied'
+    }
+    case 'updateField': {
+      const m = items.get(String(p.id))
+      if (!m) return 'dropped' // item collected — do not resurrect
+      const field = String(p.field)
+      if (m.get(field) === p.value) return 'skipped'
+      m.set(field, p.value)
+      return 'applied'
+    }
+    case 'deleteItem': {
+      const m = items.get(String(p.id))
+      if (!m) return 'dropped'
+      if (m.get('deleted') === true) return 'skipped'
+      m.set('deleted', true)
+      if (typeof m.get('deletedAt') !== 'number') m.set('deletedAt', ts)
+      return 'applied'
+    }
+    case 'adjustQty': {
+      const m = items.get(String(p.id))
+      if (!m) return 'dropped'
+      const qty = m.get('qty')
+      let exists = false
+      qty.forEach((e) => {
+        if (e && e.op === op.opId) exists = true
+      })
+      if (exists) return 'skipped'
+      qty.push([{ d: Number(p.delta), op: op.opId, ts }])
+      return 'applied'
+    }
+    case 'editNotes': {
+      const m = items.get(String(p.id))
+      if (!m) return 'dropped'
+      const notes = m.get('notes')
+      const target = String(p.newText ?? '')
+      if (notes.toString() === target) return 'skipped'
+      if (notes.length > 0) notes.delete(0, notes.length)
+      if (target) notes.insert(0, target)
+      return 'applied'
+    }
+    default:
+      return 'skipped'
+  }
+}
+
+/** Apply a batch of journal ops to `doc` in one transaction; returns the tally. */
+function applyOpsBatch(doc, ops) {
+  const items = doc.getMap('items')
+  let applied = 0
+  let skipped = 0
+  let dropped = 0
+  doc.transact(() => {
+    for (const op of ops) {
+      const r = reapplyRemoteOp(items, op)
+      if (r === 'applied') applied++
+      else if (r === 'dropped') dropped++
+      else skipped++
+    }
+  }, 'ops-endpoint')
+  return { applied, skipped, dropped }
+}
+
+/** Handle POST /rooms/:room/ops (async: reads the body, hydrates the room doc). */
+async function handleOpsPost(req, res, room) {
+  let body
+  try {
+    body = await readJsonBody(req)
+  } catch (err) {
+    sendJson(res, 400, { error: 'bad_request', reason: err && err.message })
+    return
+  }
+  const ops = Array.isArray(body.ops) ? body.ops : []
+  const name = safeRoomName(room)
+  const doc = await getRoomDoc(name)
+  const tally = applyOpsBatch(doc, ops)
+  console.log(
+    `[ops] ${name} ← ${ops.length} op(s): applied ${tally.applied}, ` +
+    `skipped ${tally.skipped}, dropped ${tally.dropped}`
+  )
+  sendJson(res, 200, {
+    ok: true,
+    room: name,
+    epoch: readEpoch(doc),
+    received: ops.length,
+    ...tally
+  })
+}
 
 /**
  * Test-only (SYNC_TEST_ENDPOINTS=1): abortively terminate every ws connection
@@ -588,6 +755,15 @@ function handleRequest(req, res) {
   // Admin: on-demand epoch seal (Phase 2 · v2.0). POST /rooms/:room/compact
   // [?force=1]. Refuses a room with connected peers unless force=1.
   if (req.method === 'POST') {
+    // Background Sync journal replay (Phase 2 · F4). Guarded/normal endpoint.
+    const om = OPS_RE.exec(url.pathname)
+    if (om) {
+      handleOpsPost(req, res, decodeURIComponent(om[1])).catch((err) => {
+        console.error('[ops] handler failed:', err && err.message)
+        if (!res.headersSent) sendJson(res, 500, { error: 'internal_error' })
+      })
+      return
+    }
     const cm = COMPACT_RE.exec(url.pathname)
     if (cm) {
       const room = decodeURIComponent(cm[1])

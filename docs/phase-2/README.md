@@ -10,7 +10,7 @@
 
 ---
 
-## ⚠️ Status banner — F1 + F2 + F3 built; F4 planned
+## ⚠️ Status banner — F1 + F2 + F3 + F4 all built
 
 **F1 (epoch compaction + rebase) is now IMPLEMENTED and wired end-to-end**:
 `server/src/compaction.mjs` (seal: collapse qty deltas, GC aged tombstones),
@@ -18,17 +18,23 @@ the server stale-writer guard + `POST /rooms/:room/compact` (`server/src/index.m
 the client epoch state machine + pending-op rebase (`app/src/crdt/store.ts`,
 `app/src/crdt/rebase.ts`) — proven by an 800-history fuzzer
 (`fuzz/epoch-compaction.fuzz.mjs`) and a full-stack browser scenario
-(`e2e/specs/epoch-rebase.spec.ts`, S8; suite 20/20 green).
+(`e2e/specs/epoch-rebase.spec.ts`, S8; suite 28/28 green).
 **F3 (pluggable persistence) is now IMPLEMENTED**: `server/src/storage.mjs`
 defines the `StorageAdapter` interface (`load` / `save` / `listRooms` / `prune`)
 with a `FileAdapter` (the v1.0 atomic temp+rename file logic, extracted
 verbatim) and a `PostgresAdapter` (`yss_snapshots` upsert via the `pg` driver,
 injectable query client); `SYNC_STORAGE=file|postgres` selects it, default
 `file` preserves v1.0 behaviour exactly, and the e2e suite boots the server
-through the adapter path. Caveat, stated plainly: the Postgres adapter is
-unit-proven against a fake query client (`server/test/storage.test.mjs`) — no
-live Postgres was reachable on this machine, so its integration test is
-skipped until `SYNC_PG_TEST_URL` points at a real DB.
+through the adapter path. The Postgres adapter is proven two ways: unit tests
+against a fake query client (`server/test/storage.test.mjs`, SQL/param/upsert
+contract) **and** a live-database integration test
+(`server/test/storage.pg.test.mjs`) running the real `PostgresAdapter` SQL —
+`CREATE TABLE`, `INSERT … ON CONFLICT DO UPDATE`, `SELECT` load, `listRooms`,
+and the `make_interval` prune — against **PGlite** (`@electric-sql/pglite`, full
+Postgres in WASM, in-process): a genuine SQL round-trip with the bytea codec
+verified over all 256 byte values and real `timestamptz` prune math, no live
+server needed. The older `SYNC_PG_TEST_URL` test still enables a round-trip
+against an external Postgres when one is reachable.
 **F2 (adversarial lossy-network testing) is now IMPLEMENTED**:
 `e2e/specs/lossy-network.spec.ts` (NET1–NET3) asserts the identical
 `expectConvergedWithServer` guarantee under real network adversity — real
@@ -43,8 +49,26 @@ chromium projects rather than a third `chromium-adversarial` project — because
 Chromium's network emulation does not reliably sever or throttle an
 already-established WebSocket, a blanket "adversarial re-run of every spec"
 would have quietly tested the clean path; the dedicated NET specs inject faults
-that are verified to actually land. **F4 remains a
-PLAN.** This suite is written to the same standard as
+that are verified to actually land.
+**F4 (real Background Sync) is now IMPLEMENTED**: the app ships a hand-written
+Workbox service worker (`app/src/sw/service-worker.ts`, `injectManifest`) that
+owns a `workbox-background-sync` `Queue` on a `NetworkOnly` route for the new
+server endpoint `POST /rooms/:room/ops` (`server/src/index.mjs`). When the device
+is offline the client POSTs its unsynced mutation-journal ops
+(`app/src/queue/backgroundSync.ts`); the failed POST is stored by the SW and
+replayed on reconnect — even after the tab closes. The server applies the batch
+idempotently, reusing the epoch/rebase **drop-not-resurrect** semantics (`opId`
+dedupe; ops on collected items are dropped). Proven in
+`e2e/specs/background-sync.spec.ts` against the **built + previewed** app on
+:5174 (where the SW is actually emitted): the failed POST is asserted in the SW
+queue, the server is confirmed NOT to have the edits, then a replay delivers them
+and the server converges **while the ws provider stays disconnected** — isolating
+the proof to the HTTP path. Honest scope: a real closed-tab background `sync`
+event is not scriptable in Playwright, so the test drives the identical
+`Queue.replayRequests()` path the browser's `sync` event fires, via a message to
+the SW (the queued request lives in the SW's own IndexedDB, independent of the
+page; the SW also wires `onSync` to the real `sync` event for production).
+This suite is written to the same standard as
 the Phase 1 docs — it distinguishes *built* from *planned*, quotes the real,
 measured v1.0 baseline, and states concrete target numbers — but the targets are
 **targets**, not results. The only measured numbers in this suite are the v1.0
@@ -91,8 +115,8 @@ the whole repository.
 |---|---|---|
 | **CRDT growth (F1)** | `qty` delta array + tombstones retained for the life of the room; `data/<room>.yss` grows monotonically | ✅ **BUILT** — server-side epoch-checkpoint compaction collapses each item's deltas to one base entry and drops aged tombstones; a long-offline client past the horizon **rebases, never resurrects** (fuzzer + S8 e2e proven) |
 | **Test fidelity (F2)** | Deterministic `provider.disconnect()` via `OfflineToggle`; 8 specs × 2 chromium projects = **16/16 green** | ✅ **BUILT** — `e2e/specs/lossy-network.spec.ts` (NET1–NET3): real `context.setOffline` offline with a **server-side proof the partition held**, six **abortive socket kills** during 24 rapid concurrent edits per client (test-only `POST /rooms/:room/kill-conns`, `SYNC_TEST_ENDPOINTS=1`), and CDP 500 ms-latency emulation with a mid-burst kill — same `expectConvergedWithServer` assertion, **6/6 green, 0 flakes at `--repeat-each=5` (30/30)**. Deviations from plan, stated plainly: server-side `terminate()` instead of `routeWebSocket`; dedicated NET specs under the existing two projects instead of a `chromium-adversarial` re-run (Chromium emulation cannot sever/throttle an established ws, so a blanket re-run would have silently exercised the clean path) |
-| **Persistence (F3)** | Single-process debounced file snapshot (`Y.encodeStateAsUpdate` → `data/<room>.yss`, atomic temp+rename, load-on-boot) | ✅ **BUILT** — a **pluggable `StorageAdapter`** (`server/src/storage.mjs`, `SYNC_STORAGE=file` \| `postgres`) writing the **same** `encodeStateAsUpdate` blob; `file` is the v1.0 logic extracted verbatim (default, byte-identical), `postgres` upserts `yss_snapshots` via `SYNC_PG_URL`. Unit-proven (19 tests: round-trip, atomicity, prune, SQL/upsert contract vs a fake client); live-Postgres integration test present but **skipped** until a real DB is reachable |
-| **Background sync (F4)** | `y-websocket` reconnect **while the tab is open** only | A genuine **Workbox `BackgroundSyncPlugin`** queue so offline edits retry **after the tab closes** — or an **honest README re-scope** if the browser support proves too thin |
+| **Persistence (F3)** | Single-process debounced file snapshot (`Y.encodeStateAsUpdate` → `data/<room>.yss`, atomic temp+rename, load-on-boot) | ✅ **BUILT** — a **pluggable `StorageAdapter`** (`server/src/storage.mjs`, `SYNC_STORAGE=file` \| `postgres`) writing the **same** `encodeStateAsUpdate` blob; `file` is the v1.0 logic extracted verbatim (default, byte-identical), `postgres` upserts `yss_snapshots` via `SYNC_PG_URL`. Unit-proven (round-trip, atomicity, prune, SQL/upsert contract vs a fake client) **and** integration-proven against an **in-process Postgres** — `server/test/storage.pg.test.mjs` runs the real adapter SQL (`ON CONFLICT` upsert, bytea round-trip over all 256 byte values, `make_interval` prune) on **PGlite** (Postgres-in-WASM); external-DB test still available via `SYNC_PG_TEST_URL` |
+| **Background sync (F4)** | `y-websocket` reconnect **while the tab is open** only | ✅ **BUILT** — a hand-written Workbox SW (`app/src/sw/service-worker.ts`, `injectManifest`) owns a `workbox-background-sync` `Queue` on a `NetworkOnly` route for the new `POST /rooms/:room/ops` endpoint; offline mutation-journal POSTs are stored and replayed after connectivity returns (even tab-closed), applied idempotently server-side with epoch/rebase drop-not-resurrect semantics. Proven in `e2e/specs/background-sync.spec.ts` against the built+previewed app on :5174 (SW emitted there), converging the server via the HTTP path with the ws provider held disconnected. Honest scope: the closed-tab `sync` event is driven via `Queue.replayRequests()` (a real browser `sync` event is not scriptable in Playwright) |
 | **CI (cross-cutting)** | None — suite is green locally, run by hand | ✅ **BUILT, not yet run remotely** — `.github/workflows/ci.yml` runs `test:fuzz` + `test:e2e` (chromium, Playwright report uploaded on failure) on every push/PR; equivalent minimal workflows added to the other five portfolio repos. Validated locally (YAML parse + the suites it invokes are green); first remote run pending push to GitHub |
 
 ---
@@ -104,7 +128,7 @@ the whole repository.
 | **F1** | **Epoch compaction / GC** | Bound the ever-growing qty-delta array + tombstones; prove a pre-horizon client **rebases** | `e2e/specs/epoch-rebase.spec.ts` |
 | **F2** | **Adversarial / lossy-network testing** ✅ built | Prove convergence survives real offline, throttling, and a **socket drop mid-sync** | `e2e/specs/lossy-network.spec.ts` + test-only `POST /rooms/:room/kill-conns` |
 | **F3** | **Pluggable authoritative persistence** ✅ built | Same blob to `file` \| Postgres; scale past one process | `server/src/storage.mjs` + `server/test/storage.test.mjs` |
-| **F4** | **Real background sync** | Offline edits retry **after tab close** — or an honest re-scope | Workbox `BackgroundSyncPlugin` + `POST /rooms/:room/ops` |
+| **F4** | **Real background sync** ✅ built | Offline edits retry **after tab close** over an HTTP replay path | `app/src/sw/service-worker.ts` (`workbox-background-sync` `Queue`) + `POST /rooms/:room/ops` + `e2e/specs/background-sync.spec.ts` |
 
 ---
 

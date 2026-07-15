@@ -100,12 +100,18 @@ extracted verbatim) or `SYNC_STORAGE=postgres` (`yss_snapshots` upsert table
 via `SYNC_PG_URL`, `pg` driver with an injectable query client). Same
 `encodeStateAsUpdate` blob either way; debounce, flush-on-shutdown,
 prune-on-boot, and load-on-boot are preserved, and the full e2e suite boots the
-server through the adapter path. Honest caveat: the Postgres adapter is proven
-by unit tests against a fake query client
-([`server/test/storage.test.mjs`](server/test/storage.test.mjs), 19 passing —
-SQL/param/upsert contract) — it has **not** been run against a live Postgres
-here (no reachable DB on the build machine; a skipped integration test enables
-with `SYNC_PG_TEST_URL`).
+server through the adapter path. The Postgres adapter is proven two ways: unit
+tests against a fake query client
+([`server/test/storage.test.mjs`](server/test/storage.test.mjs) — SQL/param/
+upsert contract) **and** a live-database integration test
+([`server/test/storage.pg.test.mjs`](server/test/storage.pg.test.mjs)) that runs
+the **real `PostgresAdapter` SQL** — the `CREATE TABLE`, the `INSERT … ON
+CONFLICT DO UPDATE` upsert, `SELECT` load, `listRooms`, and the `make_interval`
+prune — against **PGlite** (`@electric-sql/pglite`, full Postgres compiled to
+WASM, in-process). A genuine SQL round-trip (bytea codec verified over all 256
+byte values, real `timestamptz` prune math), no live server required; the older
+`SYNC_PG_TEST_URL` integration test still enables a round-trip against an
+external Postgres when one is available.
 **(2) Adversarial lossy-network testing is now built** ✅ —
 [`e2e/specs/lossy-network.spec.ts`](e2e/specs/lossy-network.spec.ts) (NET1–NET3)
 re-proves the same all-replica convergence guarantee while the network itself
@@ -125,7 +131,31 @@ already-open WebSocket, so NET1 pairs `setOffline` with the socket kill (the
 emulation then blocks every reconnect until heal) and NET3 kills mid-burst so
 the reconnect handshake actually runs under the emulated latency; the socket
 kill is a server-side abortive TCP drop, not Playwright `routeWebSocket`.
-Still **planned**: (4) **real Background Sync** (Workbox).
+**(4) Real Background Sync is now built** ✅ — offline mutations retry **after
+the tab closes**, over an HTTP replay path, not just while the tab is open. The
+app now ships a **hand-written Workbox service worker**
+([`app/src/sw/service-worker.ts`](app/src/sw/service-worker.ts),
+`strategies: 'injectManifest'`) that owns a **`workbox-background-sync` `Queue`**
+on a `NetworkOnly` route for a new server endpoint,
+**`POST /rooms/:room/ops`** ([`server/src/index.mjs`](server/src/index.mjs)).
+When the device is offline the client POSTs its unsynced mutation-journal ops
+([`app/src/queue/backgroundSync.ts`](app/src/queue/backgroundSync.ts)); the POST
+fails, the SW stores it in IndexedDB, and the browser replays it when
+connectivity returns — even with **no page open**. The server applies the batch
+**idempotently**, reusing the exact epoch/rebase **drop-not-resurrect** semantics
+(`opId` dedupe; an op on a collected item is dropped, never resurrected) and
+returns applied/skipped/dropped counts.
+[`e2e/specs/background-sync.spec.ts`](e2e/specs/background-sync.spec.ts) proves it
+against the **built + previewed app** (:5174, where the SW is actually emitted):
+make offline edits, assert the failed POST is captured in the SW queue and the
+server has **not** received them, then replay and assert the server **converges
+via the HTTP path while the ws provider stays disconnected**.
+**Honest scope of the "after tab close" proof:** a real closed-tab background
+`sync` event is not deterministically scriptable in Playwright/Chromium, so the
+test drives the *same* code path the browser's `sync` event fires —
+`Queue.replayRequests()` — via a message to the SW, and the queued request lives
+in the SW's own IndexedDB independent of the page (the SW also wires `onSync` to
+the real `sync` event for production).
 See [docs/phase-2/README.md](docs/phase-2/README.md).
 
 ---
@@ -182,10 +212,11 @@ duplicates / tombstone / ordered replay / cross-tab).
 - **Run it:** see [RUNBOOK.md](RUNBOOK.md) — `npm install`,
   `npx playwright install chromium`, `npm run dev`, `npm run test:e2e`.
 - **The proof (examples):** `e2e/specs/` (11 specs → scenarios S1–S8 including
-  the delta-counter money shot and the epoch-rebase full-stack scenario, plus
-  the NET1–NET3 adversarial lossy-network scenarios — real offline, abortive
-  socket kills mid-sync, CDP latency), run under two chromium projects —
-  **26/26 green**.
+  the delta-counter money shot and the epoch-rebase full-stack scenario, the
+  NET1–NET3 adversarial lossy-network scenarios — real offline, abortive
+  socket kills mid-sync, CDP latency — and the F4 Background Sync scenario
+  proving offline mutations replay to the server over HTTP after the tab would
+  close), run under two chromium projects — **28/28 green**.
 - **The proof (property-based):** `fuzz/crdt-convergence.fuzz.mjs` — a
   Jepsen-style fuzzer that generates **1500 random operation histories** (random
   adjust/update/delete interleaved with random partition/heal points across 3

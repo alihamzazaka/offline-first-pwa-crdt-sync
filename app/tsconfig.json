@@ -17,5 +17,7 @@
     "skipLibCheck": true
   },
   "include": ["src"],
+  "// exclude": "The service worker targets the WebWorker lib (ServiceWorkerGlobalScope, self.__WB_MANIFEST) which conflicts with the DOM lib this app config uses. vite-plugin-pwa compiles it via esbuild in the injectManifest build, so it is excluded from the app's `tsc --noEmit` pass.",
+  "exclude": ["src/sw/service-worker.ts"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

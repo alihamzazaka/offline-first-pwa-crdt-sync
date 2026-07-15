@@ -37,8 +37,16 @@ import { IndexeddbPersistence } from 'y-indexeddb'
 import { WebsocketProvider } from 'y-websocket'
 import { ROOM, WS_URL } from '../lib/room'
 import { ulid } from '../lib/ulid'
-import { markAllSynced, pendingCount, pendingOpsInOrder } from '../queue/mutationLog'
+import { markAllSynced, pendingCount, pendingOpsInOrder, subscribePendingCount } from '../queue/mutationLog'
 import { rebaseOntoBase, type RebaseResult } from './rebase'
+import {
+  setupBackgroundSync,
+  flushPendingOps,
+  backgroundSyncAvailable,
+  opsQueueSize,
+  replayOpsQueue,
+  type FlushResult
+} from '../queue/backgroundSync'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -288,6 +296,14 @@ function finishRebaseBoot(): void {
   })()
 }
 
+// --- Background Sync wiring (Phase 2 · F4) ----------------------------------
+// When the DEVICE is offline the ws provider cannot sync; the mutation journal
+// is instead flushed to the server over HTTP (POST /rooms/:room/ops) and, on a
+// failed POST, captured by the Service Worker's background-sync queue for
+// replay-after-close. This is inert without a controlling SW (so `vite dev` and
+// the core suite are unaffected); see queue/backgroundSync.ts.
+setupBackgroundSync(subscribePendingCount)
+
 // A mid-session epoch bump (forced compaction while connected) arrives as a
 // normal update to the meta map — catch it outside the handshake path too.
 doc.getMap('meta').observe(() => {
@@ -518,6 +534,15 @@ declare global {
       setOffline: (off: boolean) => void
       /** Idempotent journal replay (S3 proof). Dynamic import avoids a static store↔ops cycle. */
       replay: () => Promise<{ applied: number; skipped: number }>
+      // --- Background Sync (Phase 2 · F4) surface ---
+      /** True iff a Service Worker controls this page (background sync is live). */
+      bgSyncAvailable: () => boolean
+      /** POST the journal's unsynced ops now (fails → SW queue captures them). */
+      flushOps: () => Promise<FlushResult>
+      /** Number of mutation POSTs waiting in the SW background-sync queue. */
+      opsQueueSize: () => Promise<number>
+      /** Ask the SW to replay the queued POSTs now (deterministic sync-event stand-in). */
+      replayOpsQueue: () => Promise<{ requested: number; remaining: number }>
     }
   }
 }
@@ -531,5 +556,9 @@ window.__inv = {
   getEpoch,
   getLastRebase,
   setOffline,
-  replay: async () => (await import('./ops')).replayJournal()
+  replay: async () => (await import('./ops')).replayJournal(),
+  bgSyncAvailable: backgroundSyncAvailable,
+  flushOps: flushPendingOps,
+  opsQueueSize,
+  replayOpsQueue
 }
