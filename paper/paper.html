@@ -1,0 +1,179 @@
+<h1 class="title">Rebase, Not Resurrect: Bounded-Growth Epoch Compaction for an Offline-First CRDT Inventory PWA, Verified by Property Fuzzing</h1>
+
+<div class="authors">Ali Hamza</div>
+<div class="affil">Independent Research · Built and evaluated on a single RTX 5080 (16 GB) — a pure web / distributed-systems project, no GPU used</div>
+
+<div class="abstract">
+<b>Abstract—</b> Most "offline support" in web portfolios is a service worker caching the app shell so the page merely <i>loads</i> offline; the moment two disconnected clients edit the same record, naive last-write-wins (LWW) silently destroys one write. We present an offline-first Progressive Web App (PWA) for stock-count inventory that instead guarantees convergence: after any interleaving of offline edits and reconnects across two or more clients, every replica and the server reach identical state with zero lost writes and zero duplicates. The design uses a Yjs CRDT with a delta-counter (a PN-counter over a <i>Y.Array</i>) so concurrent offline adjustments <i>add up</i> — our money shot starts a counter at 10, applies a concurrent offline +5 and +3, and converges to <b>18</b>, where naive LWW would show 13 or 15. We then address the CRDT's unbounded growth with server-side <i>epoch compaction</i>: a seal collapses each item's whole delta history to a single base entry (a deterministic case collapses <b>500 deltas to 1</b>) and garbage-collects aged tombstones, while a long-offline client is forced to <i>rebase, not resurrect</i>. Correctness is proven three ways: <b>28/28</b> Playwright end-to-end runs, <b>1500</b> convergence-fuzz histories, and <b>800</b> seal/rebase-fuzz histories, all green. We foreground the honest caveats: the CI workflow is written but not yet run remotely, the closed-tab background-sync proof drives the same code path rather than a real browser <i>sync</i> event, and the headline size-reduction magnitudes remain illustrative targets, not measured results.
+</div>
+
+<div class="keywords">
+<b>Index Terms—</b> CRDT, offline-first, local-first software, conflict resolution, epoch compaction, garbage collection, property-based testing, Progressive Web App.
+</div>
+
+<h2>1. Introduction</h2>
+
+<p>Field workers, warehouse staff, and users on flaky mobile networks lose connectivity constantly. An application built for them must keep functioning with the network completely off and, critically, reconcile changes when the network returns — <i>without losing data when two people edited the same thing</i>. This is a distributed-systems problem wearing a web-app costume, and it is the hard part that most "offline" portfolios skip.</p>
+
+<p>The common baseline — "fake offline" — is a service worker that precaches the app shell so the page loads without a network. That is a legitimate but shallow capability: it cannot reconcile concurrent writes, because it is not sync at all. The naive default for sync — last-write-wins (LWW) — is worse than doing nothing, because it fails <i>silently</i>: on reconnect the last write to arrive overwrites the first, and the first client's edit simply vanishes with no error and no trace [SPEC §0, §10].</p>
+
+<p>This paper describes a build whose credible headline is <i>not</i> "first offline PWA." It is a <b>measured, reproducible correctness result on a named axis</b>: after arbitrary offline edit interleavings, all replicas converge, no writes are lost, and no records are duplicated — and the claim is backed by an automated test suite anyone can clone and run. The chosen domain is offline stock-count/inventory, which has the one data shape that breaks naive CRDT modelling — a <i>counter</i> — solved here with a delta-counter so concurrent offline adjustments accumulate instead of clobbering one another.</p>
+
+<p>Beyond the base correctness result, the paper's technical centrepiece is what happens over the <i>lifetime</i> of a long-lived collaborative document. A CRDT that never forgets history grows without bound: the delta-counter appends one entry per adjustment forever, and deletes are retained as tombstones for the life of the room. We bound both with server-side <b>epoch compaction</b>, and we solve the subtle correctness hazard it creates — a long-offline client resurrecting collected state on merge — with a client-side <b>rebase</b> protocol.</p>
+
+<h3>1.1 Contributions</h3>
+
+<p>This work makes the following concrete, reproducible contributions:</p>
+
+<p>1. <b>A provably correct offline-first inventory CRDT.</b> A Yjs-based design where different-field edits merge for free, same-field edits converge by deterministic client ordering, deletes are tombstones (delete wins visibility, edits preserved beneath), and — the crux — quantity is a delta-counter so two concurrent offline adjustments <i>sum</i>. The anti-LWW money shot is a counter that starts at 10 and converges to 18 after a concurrent offline +5 and +3.</p>
+
+<p>2. <b>Epoch compaction that bounds unbounded CRDT growth.</b> A pure, side-effect-free server module seals a new epoch at a safe checkpoint (an idle room), collapsing each item's entire delta history to a single base entry and garbage-collecting tombstones past a configurable horizon. A deterministic test collapses a 500-entry delta array to 1.</p>
+
+<p>3. <b>A rebase-not-resurrect protocol.</b> A client that was offline across a seal cannot be allowed to merge naively — it would resurrect collected items and collide containers. Instead it <i>adopts</i> the server's epoch base and replays only its genuinely-pending journal ops, <i>dropping</i> any op that targets a collected item.</p>
+
+<p>4. <b>Three-way verification.</b> 28/28 Playwright end-to-end runs across the full scenario catalogue, a 1500-history Jepsen-style convergence fuzzer, and an 800-history seal/rebase fuzzer — plus an adversarial lossy-network suite green at 30/30 under repetition.</p>
+
+<p>5. <b>An honest empirical account.</b> We report the property the fuzzer <i>surfaced</i> (a concurrent-create collision the app avoids by design), the deliverables that are gated (remote CI, real closed-tab sync, real-database round-trips), and the size-reduction figures that remain targets rather than measured results.</p>
+
+<h2>2. Related Work and Baselines</h2>
+
+<p>The techniques composed here are mature; the contribution is <i>correctly composing and proving</i> them, not inventing them. <b>CRDTs</b> are a solved research area: Shapiro et al.'s comprehensive study of convergent and commutative replicated data types [1] and the foundational conflict-free replicated data type paper [2] establish the convergence theory this build relies on, and the delta-state formulation of Almeida, Shoker, and Baquero [3] is the model for collapsing a delta history into a compacted base without losing convergence. The PN-counter used for quantity is a classic CRDT counter construction from that literature.</p>
+
+<p>Production-grade CRDT libraries exist: <b>Yjs</b> [5] (with <i>y-indexeddb</i> for local persistence, <i>y-websocket</i> for transport, and <i>y-protocols/sync</i> for the state-vector handshake) and <b>Automerge</b> [6]. <b>Operational Transform</b> [7] powers Google Docs and is the more complex alternative to CRDTs. The philosophy is articulated in the <b>Local-First Software</b> manifesto [4]. Turnkey local-first sync stacks — ElectricSQL, PowerSync, RxDB, TinyBase, and Dexie [17] — already package this as a service; we deliberately hand-roll the sync layer to make the correctness argument explicit and testable rather than delegated.</p>
+
+<p>The compaction/GC design draws on Yjs's own state-vector and update-encoding primitives [5] and, for the "a stale client must catch up from a checkpoint rather than replay its whole history" pattern, on Dynamo-style anti-entropy reconciliation [8]. The adversarial testing methodology is inspired by <b>Jepsen</b> [9] — network partitions and socket kills as first-class test inputs. Real background retry uses the <b>Web Background Synchronization</b> draft [11] and Workbox's background-sync queue [10]; the PWA platform surface is the MDN Service Worker, Background Sync, IndexedDB, and Web App Manifest specs [12]. Verification uses <b>Playwright</b> [13] for multi-context browser tests and <b>fast-check</b> [16] for property fuzzing.</p>
+
+<p><b>Named baselines to beat.</b> Per the project's evaluation spec, the comparison is against two explicit baselines [05-evaluation-metrics.md §3]: (i) <i>"fake offline"</i> (cache-the-shell), which cannot reconcile concurrent writes; and (ii) <i>naive LWW</i>, which loses data silently. The win is beating both — real bidirectional sync where both concurrent edits survive a correct automatic merge — proven reproducibly.</p>
+
+<h2>3. Method and System Design</h2>
+
+<p>Figure 1 shows the system. Each client is a local-first PWA (React + Vite) whose UI reads and writes a single <i>Y.Doc</i> first, so the app is fully usable with the network off. The document is a top-level <i>items</i> <i>Y.Map</i>; each item is a <i>Y.Map</i> with scalar fields (<i>sku</i>, <i>name</i>, <i>location</i>), a <i>notes</i> <i>Y.Text</i>, a <i>deleted</i> tombstone flag, and — the interesting field — a <i>qty</i> <i>Y.Array</i> of signed deltas. The client persists to IndexedDB via <i>y-indexeddb</i> and transports over a hand-rolled <i>y-websocket</i> relay (Node, port 4444); the app runs on Vite (port 5173). No GPU is used anywhere in the project.</p>
+
+<div class="fig"><img src="figures/fig1.png" style="width:12cm;"><div class="cap">Figure 1. System architecture. Two local-first PWA clients each hold a Yjs document (items as a Y.Map, qty as a delta-counter Y.Array, deletes as tombstones), an epoch state machine, IndexedDB persistence, and a background-sync queue. The relay merges over y-websocket, guards stale writers by adopted epoch, seals epochs via compaction.mjs, and persists through a pluggable StorageAdapter (file or Postgres).</div></div>
+
+<h3>3.1 The conflict model, chosen deliberately</h3>
+
+<p>The conflict model is a stated, defended choice [README, docs/01-overview §3]. We use a <b>Yjs CRDT</b> because it is the easiest path to a <i>provably correct</i> automatic merge. The design decisions follow the data shapes: different-field edits merge for free (per-key <i>Y.Map</i>); same-field scalar edits converge by Yjs's deterministic client ordering; deletes are tombstones so an edit concurrent with a delete cannot resurrect the item, but the edit is preserved beneath the tombstone; and quantity — the shape that breaks naive CRDTs — is a <b>delta-counter</b> (a PN-counter built as a <i>Y.Array</i> of <i>{d, op, ts}</i> entries). The effective quantity is the sum of all deltas, so two concurrent offline adjustments both survive. Item ids are minted as fresh ULIDs per create, which (as §6 explains) is not cosmetic but a correctness requirement.</p>
+
+<h3>3.2 Epoch compaction: bounding growth</h3>
+
+<p>The delta-counter and the tombstone set both grow monotonically — one delta entry per adjustment, tombstones for the life of the room. Left alone, a busy count session accretes thousands of deltas whose sum is a single number, and the snapshot grows without bound. <b>Epoch compaction</b> (<i>server/src/compaction.mjs</i>) bounds both. <i>sealEpoch</i> returns a fresh <i>Y.Doc</i> — it never mutates the source — in which each surviving item's <i>qty</i> is collapsed to one base delta equal to its sum, tombstones older than a horizon are dropped, and <i>meta.epoch</i> is bumped. Figure 2 (left) shows the deterministic case from the fuzzer: a 500-entry delta array collapses to <b>1</b> base entry preserving the value 500, and one aged tombstone is garbage-collected while a recent one is kept.</p>
+
+<div class="fig"><img src="figures/fig2.png" style="width:12cm;"><div class="cap">Figure 2. Epoch compaction (F1). Left: a seal collapses an item's entire qty-delta history to a single base entry — 500 → 1 in the deterministic test — bounding growth independently of how many adjustments occurred. Right: a client offline across the seal rebases rather than resurrects — it adopts the server base, replays only pending journal ops, and drops any op whose item was collected. Both properties are asserted over 800 random seal/rebase histories.</div></div>
+
+<h3>3.3 Rebase, not resurrect</h3>
+
+<p>Compaction is only half the feature. If the server rebuilds the room with fresh item containers and a long-offline client later reconnects and does a normal Yjs merge, two failures occur [compaction.mjs header]. First, <b>resurrection</b>: the client still holds the pre-compaction live struct for an item the server garbage-collected, and merging re-introduces a delete that was already agreed and collected. Second, <b>container collision</b>: the compacted item is a <i>new</i> <i>Y.Map</i> under the same id, so the client's old <i>Y.Map</i> is a concurrent register write and Yjs keeps exactly one container, silently discarding the other's deltas.</p>
+
+<p>The client-side rebase (<i>app/src/crdt/rebase.ts</i>) solves both. On detecting that the server advanced to a newer epoch, the client discards its pre-seal doc, <i>adopts</i> the server's epoch base (rather than merging into it), and replays only its genuinely-pending journal ops on top — dropping any op that targets an item the epoch collected (Figure 2, right). The wire protocol carries the client's adopted epoch as a WebSocket query parameter, and the relay's <b>stale-writer guard</b> serves state to, but discards writes from, pre-epoch connections. The natural safe checkpoint is an idle room: every client that was connected has, by definition, synced, so the only replica that can be behind is one reconnecting later — precisely the case the rebase protocol handles.</p>
+
+<h3>3.4 Persistence, background sync, and adversarial hooks</h3>
+
+<p>The relay writes one debounced snapshot per room (default 750&nbsp;ms) through a pluggable <b>StorageAdapter</b> (<i>server/src/storage.mjs</i>): <i>SYNC_STORAGE=file</i> (the default, byte-identical to the atomic temp-file+rename v1.0 behaviour) or <i>SYNC_STORAGE=postgres</i> (an upsert into a <i>yss_snapshots</i> table via the <i>pg</i> driver). The same <i>encodeStateAsUpdate</i> blob is written either way. Offline mutations also retry over an HTTP path via a hand-written Workbox service worker that owns a <i>workbox-background-sync</i> queue on a <i>NetworkOnly</i> route to <i>POST /rooms/:room/ops</i>; the server applies the batch idempotently, reusing the same drop-not-resurrect semantics (opId dedupe; an op on a collected item is dropped). An adversarial lossy-network suite injects real faults through a test-only, off-by-default <i>POST /rooms/:room/kill-conns</i> endpoint.</p>
+
+<h2>4. Experimental Setup</h2>
+
+<p><b>Hardware and environment.</b> The project was built and evaluated on a single machine with an RTX 5080 (16 GB), but the workload is pure web/distributed-systems: <i>no GPU is used</i>. Requirements are Node 18+ and a Chromium that Playwright installs; ports 5173 (app) and 4444 (relay) [RUNBOOK §0].</p>
+
+<p><b>"Datasets" = test scenarios.</b> The artifact's credibility is a reproducible correctness test, so the "data" is a scenario catalogue [SPEC §4]: same-field concurrent edit, different-field concurrent edit, offline create ×N, delete-vs-edit race, a long-offline queue of 50 ops, three-way (A, B, server) merge, multi-tab on one device, the delta-counter adjustment, and the epoch-rebase full-stack scenario (S8), plus the adversarial NET1–NET3 and the F4 background-sync scenario.</p>
+
+<p><b>Metrics.</b> Correctness, not throughput, is the headline [docs/05 §1]. Every metric is a pass/fail assertion first: <i>convergence</i> (all replicas byte/field-identical after sync settles), <i>no lost writes</i> (concurrent different-field edits both persist), <i>no duplicates</i> (offline creates replay idempotently to exactly N records), and <i>defined conflict behavior</i> (same-field conflicts resolve per the documented rule, never a silent overwrite). The one quantitative family is F1's size-bounding — measuring that growth is bounded, not speed.</p>
+
+<p><b>Protocol and tooling.</b> End-to-end tests use Playwright multi-context automation [13]: each test spins up isolated A/B (and C) browser contexts and a unique sync room, under two Chromium projects (<i>chromium-client-a</i>, <i>chromium-client-b</i>). Property fuzzing uses fast-check [16] over pure Node + Yjs (no browser). The convergence fuzzer generates random operation histories across three replicas with random partition/heal points; the epoch fuzzer generates random seal/rebase histories including adversarial pending ops on items the seal is about to collect. Every claimed number below is either a <i>measured</i> result from the repo or an explicitly-labelled <i>target</i>.</p>
+
+<h2>5. Results</h2>
+
+<p>Figure 3 summarizes the verification coverage; all of it is green.</p>
+
+<div class="fig"><img src="figures/fig3.png" style="width:11cm;"><div class="cap">Figure 3. Verification coverage (log scale). The base correctness result is proven three ways: 28/28 Playwright end-to-end runs, 800 seal/rebase-fuzz histories, and 1500 convergence-fuzz histories, plus the adversarial lossy-network suite at 30/30 under repetition. 100% green, 0 flakes.</div></div>
+
+<h3>5.1 Base convergence correctness</h3>
+
+<p>The full Playwright suite is <b>28/28 green</b> — 11 spec files, 14 tests, run under two Chromium projects [README §Status]. Each test asserts convergence across <i>all</i> replicas (both clients and the server) plus its specific guarantee. The v1.0 core of this suite (before the Phase-2 additions) was <b>16/16 green</b> — 8 specs × 2 projects [docs/phase-2/05 §2]. Table 1 reproduces the money table; every row is an automated assertion.</p>
+
+<div class="tablecap">Table 1. The money table — every row an automated Playwright assertion across all replicas (clients + server). Source: docs/05-evaluation-metrics.md §4; e2e/specs/.</div>
+<table>
+<tr><th>Scenario</th><th>Expected outcome</th><th>Guarantee</th></tr>
+<tr><td>Same-field concurrent edit</td><td>Converges to defined result</td><td>Defined conflict behavior</td></tr>
+<tr><td>Different-field concurrent edit</td><td>Both survive</td><td>No lost writes</td></tr>
+<tr><td>Offline create ×N → reconnect</td><td>Exactly N records</td><td>Idempotency (ULID)</td></tr>
+<tr><td>Delete-vs-edit race</td><td>Tombstone; edit preserved</td><td>Deterministic delete/edit</td></tr>
+<tr><td>Long-offline queue (50 ops)</td><td>Replays correctly, in order</td><td>Ordered replay</td></tr>
+<tr><td>Three-way (A, B, server)</td><td>All converge identically</td><td>Convergence</td></tr>
+<tr><td>Multi-tab, one device</td><td>Tabs stay consistent</td><td>Cross-tab concurrency</td></tr>
+</table>
+
+<h3>5.2 The delta-counter money shot</h3>
+
+<p>The anti-LWW result is the counter (Figure 4). Starting from <i>qty</i> = 10, client A goes offline and applies +5 while client B goes offline and applies +3; after reconnect and heal, <i>every</i> replica shows <b>18</b> (10 + 5 + 3) — both adjustments survived [e2e/specs/qty-concurrent-adjust.spec.ts]. A naive LWW register would have shown 15 (A wins) or 13 (B wins), silently losing one write. This is the concrete, reproducible instance of the named win over both baselines.</p>
+
+<div class="fig"><img src="figures/fig4.png" style="width:10.5cm;"><div class="cap">Figure 4. The delta-counter money shot. Concurrent offline adjustments +5 and +3 on a counter starting at 10 converge to 18 on every replica; naive last-write-wins would show 13 or 15, silently dropping one write. Asserted in qty-concurrent-adjust.spec.ts and, over 1500 random histories, by the convergence fuzzer's qty = sum-of-deltas invariant.</div></div>
+
+<h3>5.3 Property fuzzing</h3>
+
+<p>The convergence fuzzer runs <b>1500 random histories</b> [fuzz/crdt-convergence.fuzz.mjs, numRuns=1500], each generating random adjust/update/delete operations across three replicas interleaved with random partition/heal points, then a final all-to-all heal. It asserts three invariants on every history: <i>convergence</i> (all replicas byte-identical), <i>qty = sum of applied deltas</i> (the anti-LWW property), and <i>tombstone</i> (a delete is never lost and an edit never resurrects a deleted item). All 1500 pass.</p>
+
+<h3>5.4 Epoch compaction and rebase</h3>
+
+<p>The epoch fuzzer runs <b>800 random seal/rebase histories</b> [fuzz/epoch-compaction.fuzz.mjs, numRuns=800], driving the <i>real</i> server seal (<i>compaction.mjs</i>) against a rebase model faithful to <i>rebase.ts</i>. Five invariants hold on every history: <b>bounded</b> (each sealed item's qty array has ≤ 1 entry and no collectible tombstone remains); <b>value-preserving</b> (the collapsed base qty equals the pre-seal effective qty); <b>no-resurrect</b> (items collected by the seal never reappear after rebase, and the rebase reports exactly the number of dropped ops); <b>no-double-count</b> (a surviving item's final qty equals base + the client's pending deltas only — already-synced deltas folded into the base are not replayed); and <b>convergence</b> (server and client byte-identical and both carry the new epoch after a final heal). A deterministic companion case collapses a 500-entry delta array to a single base entry preserving value 500, GCs exactly one aged tombstone, and keeps a recent one. The full-stack S8 scenario proves the same end-to-end in a browser: two live clients, a real <i>POST /rooms/:room/compact</i> seal while a client is offline, reconnect, automatic rebase (clear + reload + pending replay), and convergence with the collected item gone and the pending edit preserved.</p>
+
+<h3>5.5 Adversarial lossy-network</h3>
+
+<p>The lossy-network suite (NET1–NET3) re-proves the identical all-replica convergence guarantee while the network itself misbehaves: NET1 uses real browser-level offline (<i>context.setOffline</i>) with a server-side assertion that no write leaked through the partition; NET2 abortively terminates every WebSocket of the room six times during 24 rapid concurrent edits per client, and the reconnect + state-vector handshake must recover exactly the missing updates; NET3 adds CDP-emulated 500&nbsp;ms latency with a mid-burst kill. Result: <b>6/6 green, 0 flakes across --repeat-each=5 (30/30)</b> [README, docs/phase-2/README].</p>
+
+<h2>6. Discussion: Honest Negative and Corrected Findings</h2>
+
+<p>Per the standards of an empirical systems paper, the corrected findings are first-class results, not blemishes.</p>
+
+<p><b>A real correctness hazard the fuzzer surfaced.</b> The convergence fuzzer surfaced a genuine model property [fuzz/crdt-convergence.fuzz.mjs header]: an item is a <i>Y.Map</i> stored under its id in a top-level <i>items</i> <i>Y.Map</i>. If two replicas concurrently <i>create the same id</i>, that top-level key receives two concurrent register-writes; Yjs keeps exactly one <i>Y.Map</i> and discards the other — <i>including any qty deltas pushed into the losing container before the merge</i>. That would violate the qty = sum-of-deltas invariant and silently lose writes — the very failure the whole design exists to prevent. The app avoids it entirely by minting a fresh ULID per create, so two replicas never generate the same id; the fuzzer therefore creates each id once and then exercises the real concurrency surface. This is exactly the kind of subtle CRDT container-collision bug that only property testing exposes, and it is the same hazard the epoch-container-collision problem (§3.3) is a second instance of.</p>
+
+<p><b>CI is written but has not run remotely.</b> A GitHub Actions workflow (<i>.github/workflows/ci.yml</i>) runs <i>npm ci</i> → Playwright chromium → <i>test:fuzz</i> → <i>test:e2e</i> with the report uploaded on failure. It has been validated locally (YAML parse plus the suites it invokes are green) but has <b>not yet run on a remote runner</b> pending a first push [README §Phase 2]. Until it does, "green in CI" is a claim about local runs, not a hosted artifact.</p>
+
+<p><b>The closed-tab background-sync proof drives the same code path, not a real sync event.</b> A real closed-tab background <i>sync</i> event is not deterministically scriptable in Playwright/Chromium. The test therefore drives the <i>same</i> code path the browser's <i>sync</i> event fires — <i>Queue.replayRequests()</i> — via a message to the service worker; the queued request does live in the service worker's own IndexedDB independent of the page, and the SW also wires <i>onSync</i> to the real event for production. This proves the HTTP replay path and queue isolation, but not, in an automated test, the browser actually firing <i>sync</i> after the tab closes.</p>
+
+<p><b>Postgres: real SQL is integration-tested in-process; the TCP driver is only unit-tested.</b> The <i>PostgresAdapter</i>'s real SQL — <i>CREATE TABLE</i>, the <i>INSERT … ON CONFLICT DO UPDATE</i> upsert, <i>SELECT</i> load, <i>listRooms</i>, and the <i>make_interval</i> prune — is integration-tested against PGlite [15] (full Postgres compiled to WASM, in-process), a genuine SQL round-trip with the bytea codec verified over all 256 byte values. But the <i>pg</i> driver's real TCP <i>Pool</i> wiring is still only unit-tested against a fake query client; a round-trip against an external Postgres is gated behind an opt-in <i>SYNC_PG_TEST_URL</i> [RUNBOOK §4d].</p>
+
+<p><b>The size-reduction magnitudes are targets, not measured results.</b> The evaluation spec states a target of "≥ 99% fewer deltas" and "≥ 90% smaller snapshot" for a room with L = 100 live items and A = 10 000 adjustments [docs/phase-2/05 §3–4], but these magnitudes are explicitly labelled <i>illustrative targets</i>; the fixed contract is the <i>shape</i> of the win — snapshot size becomes a function of live item count, not of historical adjustment count — which the 500 → 1 collapse and the "bounded" fuzz invariant do demonstrate. We do not present the 90%/99% figures as achieved measurements.</p>
+
+<p><b>Scoping deviations, stated plainly.</b> The lossy-network socket kill is a server-side abortive <i>terminate()</i> (a real TCP drop) rather than a Playwright <i>routeWebSocket</i> interception, and the NET specs run under the existing two Chromium projects rather than a dedicated adversarial project — because Chromium's network emulation does not reliably sever or throttle an already-established WebSocket, so a blanket "adversarial re-run of every spec" would have quietly exercised the clean path [docs/phase-2/README]. Finally, simultaneous multi-tab rebase has a narrow re-persistence window, documented in <i>store.ts</i>.</p>
+
+<h2>7. Limitations and Ethical Considerations</h2>
+
+<p><b>What is gated.</b> This is a solid, reproducible engineering artifact, but several items must be completed before it would clear peer review as an empirical systems paper, and we state that plainly. (i) <b>Remote CI</b>: the workflow must actually run on hosted runners so "green" is an externally-verifiable fact, not a local claim. (ii) <b>Measured size reduction</b>: the L = 100 / A = 10 000 snapshot-byte and delta-count reductions must be <i>measured</i> and reported with the actual numbers, replacing the current targets. (iii) <b>Real closed-tab sync</b>: a demonstration that the browser fires <i>sync</i> and delivers after a genuinely closed tab, beyond driving the same code path. (iv) <b>Real-database round-trips</b>: the <i>pg</i> TCP driver against an external Postgres, and the multi-instance/two-writer convergence boundary, remain smoke-level or unit-level. (v) <b>Longitudinal / field data</b>: there is no human evaluation and no real low-connectivity field deployment; all "data" here is synthetic scenarios and property-generated histories. Peer-reviewed acceptance depends on completing these; the present contribution is a correctness result and a compaction/rebase design proven by property fuzzing, not a measured production study.</p>
+
+<p><b>Ethical considerations.</b> The system stores inventory records locally in IndexedDB and on a relay; in a real deployment this raises ordinary data-retention and access-control questions (offline devices holding un-synced data, tombstones retaining deleted records until GC). The design is domain-neutral and carries no ML model, no user profiling, and no automated decision-making, so the surface for misuse is small; the main honest caveat is that a lost or stolen offline device retains its local store until cleared. No personal data was used in evaluation.</p>
+
+<h2>8. Conclusion and Future Work</h2>
+
+<p>We built an offline-first inventory PWA whose headline is a measured, reproducible correctness result: after any interleaving of offline edits and reconnects, all replicas converge with zero lost writes and zero duplicates, demonstrated by a delta-counter that turns a concurrent offline +5 and +3 into a converged 18 where naive LWW loses a write. We then bounded the CRDT's unbounded growth with epoch compaction (500 deltas → 1 base entry) and solved the resulting resurrection hazard with a rebase-not-resurrect protocol, verifying the whole with 28/28 end-to-end runs, 1500 convergence-fuzz histories, and 800 seal/rebase-fuzz histories, all green.</p>
+
+<p>Future work follows directly from §7: run the CI remotely and publish the badge; measure and report the actual snapshot-byte reduction under the L/A workload; add a genuine closed-tab <i>sync</i> demonstration; exercise the <i>pg</i> TCP driver and the two-writer boundary against a real Postgres; and pursue a small field study in a low-connectivity setting to turn synthetic scenarios into observed workloads. The distributed-systems core — a compaction/GC scheme that provably preserves convergence via client rebase — is the piece most worth generalizing beyond inventory.</p>
+
+<h2>References</h2>
+<div class="refs">
+[1] M. Shapiro, N. Preguiça, C. Baquero, M. Zawirski. A Comprehensive Study of Convergent and Commutative Replicated Data Types. INRIA, Research Report RR-7506, 2011.<br>
+[2] M. Shapiro, N. Preguiça, C. Baquero, M. Zawirski. Conflict-Free Replicated Data Types. Proc. SSS (Stabilization, Safety, and Security of Distributed Systems), 2011.<br>
+[3] P. S. Almeida, A. Shoker, C. Baquero. Delta State Replicated Data Types. Journal of Parallel and Distributed Computing, 2018. arXiv:1603.01529.<br>
+[4] M. Kleppmann, A. Wiggins, P. van Hardenberg, M. McGranaghan. Local-First Software: You Own Your Data, in Spite of the Cloud. Ink &amp; Switch, 2019.<br>
+[5] K. Jahns et al. Yjs — A CRDT framework with a powerful abstraction of shared data. yjs.dev; companion packages y-indexeddb, y-websocket, y-webrtc, y-protocols.<br>
+[6] Automerge — A JSON-like CRDT and the automerge-repo sync protocol. automerge.org.<br>
+[7] C. Ellis, S. Gibbs. Operational Transformation background (Google Docs / Wave). Concurrency control in groupware systems, 1989.<br>
+[8] G. DeCandia et al. Dynamo: Amazon's Highly Available Key-value Store. Proc. SOSP, 2007.<br>
+[9] K. Kingsbury. Jepsen — Distributed-systems fault-injection methodology (network partitions, socket kills, clock skew). jepsen.io.<br>
+[10] Google. Workbox — Service worker toolkit; workbox-background-sync module. developer.chrome.com/docs/workbox.<br>
+[11] W3C WICG. Web Background Synchronization (Community Group draft). wicg.github.io/background-sync.<br>
+[12] Mozilla Developer Network. Service Worker API, Background Synchronization API, IndexedDB API, Web App Manifest. developer.mozilla.org.<br>
+[13] Microsoft. Playwright — Multi-context browser automation with offline toggling and network throttling. playwright.dev.<br>
+[14] The PostgreSQL Global Development Group. PostgreSQL 17; node-postgres (pg) driver. postgresql.org; node-postgres.com.<br>
+[15] ElectricSQL. PGlite — PostgreSQL compiled to WebAssembly, in-process. electric-sql.com/pglite.<br>
+[16] N. Dubien. fast-check — Property-based testing for JavaScript and TypeScript. github.com/dubzzz/fast-check.<br>
+[17] Turnkey local-first sync stacks: ElectricSQL, PowerSync, RxDB, TinyBase, Dexie (+ Dexie Cloud).
+</div>
+
+<h2>Appendix A. Reproducibility</h2>
+
+<p><b>Stack and versions.</b> React + Vite PWA; Yjs CRDT with y-indexeddb and a hand-rolled y-websocket relay; Workbox service worker (injectManifest) with workbox-background-sync; Node 18+ backend; StorageAdapter over file (default) or Postgres via the pg driver; Playwright (two Chromium projects) and fast-check for testing. No GPU; ports 5173 (app) and 4444 (relay).</p>
+
+<p><b>Commands</b> [RUNBOOK]. Install: <i>npm install</i> then <i>npx playwright install chromium</i>. Run both servers: <i>npm run dev</i>. End-to-end suite (starts its own servers): <i>npm run test:e2e</i> → 28/28. Fuzzers: <i>npm run test:fuzz</i> → 1500 convergence + 800 seal/rebase histories. Lossy-network flake budget: <i>npx playwright test lossy-network --repeat-each=5</i> → 30/30. On-demand seal: <i>POST /rooms/&lt;room&gt;/compact</i>; room epoch is visible in <i>GET /rooms/&lt;room&gt;/snapshot</i>. Postgres-backed snapshots: <i>SYNC_STORAGE=postgres SYNC_PG_URL=… npm run dev:server</i>; adapter tests: <i>npm run test:storage</i> (includes the PGlite in-process integration pass).</p>
+
+<p><b>Key parameters.</b> Snapshot debounce <i>SYNC_PERSIST_MS</i> = 750&nbsp;ms; tombstone horizon <i>SYNC_COMPACT_TOMBSTONE_MS</i> = 7 days; idle auto-seal pressure <i>SYNC_COMPACT_MIN_PRESSURE</i> = 64 (auto-compaction opt-in via <i>SYNC_AUTO_COMPACT=1</i>); snapshot prune age <i>SNAPSHOT_MAX_AGE_DAYS</i> = 30. Fuzz budgets: 1500 convergence histories over 3 replicas; 800 seal/rebase histories over up to 4 items each.</p>
